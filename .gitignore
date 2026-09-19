@@ -1,3 +1,18 @@
+# =========================
+# macOS System Files
+# =========================
+
+# Finder metadata (the classic one!)
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.apdisk
+.AppleDouble
+.LSOverride
+
 # object files
 *.o
 *.obj
@@ -19,3 +34,11 @@ openssl/
 
 # custom zlib build for Windows
 zlib_mingw/
+
+sslscan
+sslscan-amd64
+sslscan-amd64-static
+sslscan-linux-amd64-static
+sslscan-linux-arm64
+sslscan-linux-arm64-static
+sslscan-mac-arm64

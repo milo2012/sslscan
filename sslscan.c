@@ -137,6 +137,9 @@
 /** Does output xml to stdout? */
 static int xml_to_stdout = 0;
 
+/** Is --oneline mode active?  Suppresses regular console output (see printf macro). */
+static int oneline_output = 0;
+
 const char *inet_ntop(int af, const void *src, char *dst, socklen_t size);
 
 const SSL_METHOD *TLSv1_3_client_method(void)
@@ -1609,6 +1612,38 @@ char *cipherRemove(char *str, const char *sub) {
     return str;
 }
 
+/* Builds the initial cipherstring for cipher enumeration into buf.  When
+ * --rc4, --3des and/or --des is used, only the requested bulk cipher(s) are
+ * included (combined as a union); otherwise all available ciphersuites are
+ * used. */
+void getInitialCipherList(struct sslCheckOptions *options, char *buf, size_t buflen) {
+    buf[0] = '\0';
+    if (options->onlyRC4)
+        strncat(buf, CIPHERSUITE_LIST_RC4, buflen - strlen(buf) - 1);
+    if (options->only3DES) {
+        if (buf[0] != '\0')
+            strncat(buf, ":", buflen - strlen(buf) - 1);
+        strncat(buf, CIPHERSUITE_LIST_3DES, buflen - strlen(buf) - 1);
+    }
+    if (options->onlyDES) {
+        if (buf[0] != '\0')
+            strncat(buf, ":", buflen - strlen(buf) - 1);
+        strncat(buf, CIPHERSUITE_LIST_DES, buflen - strlen(buf) - 1);
+    }
+    if (buf[0] == '\0')
+        strncpy(buf, CIPHERSUITE_LIST_ALL, buflen);
+}
+
+/* Returns true if the cipherstring is still the initial (un-narrowed) list.
+ * In that case the next accepted cipher is the server's preferred one. */
+int isInitialCipherList(struct sslCheckOptions *options) {
+    char initial[64];
+    if (strcmp(options->cipherstring, TLSV13_CIPHERSUITES) == 0)
+        return true;
+    getInitialCipherList(options, initial, sizeof(initial));
+    return strcmp(options->cipherstring, initial) == 0;
+}
+
 /* Outputs an accepted cipher to the console and XML file. */
 void outputCipher(struct sslCheckOptions *options, SSL *ssl, const char *cleanSslMethod, uint32_t cipherid, const char *ciphername, int cipherbits, int cipher_accepted, unsigned int milliseconds_elapsed) {
   char hexCipherId[8] = {0};
@@ -1617,8 +1652,16 @@ void outputCipher(struct sslCheckOptions *options, SSL *ssl, const char *cleanSs
 
 
   printf_xml("  <cipher status=\"");
+  if (cipher_accepted && options->oneline) {
+    /* In one-line mode, collect the accepted cipher for the summary instead
+     * of printing the full details here (console output is suppressed; the
+     * XML output below stays identical to a normal run). */
+    if (options->oneline_ciphers[0] != '\0')
+      strncat(options->oneline_ciphers, ",", sizeof(options->oneline_ciphers) - strlen(options->oneline_ciphers) - 1);
+    strncat(options->oneline_ciphers, ciphername, sizeof(options->oneline_ciphers) - strlen(options->oneline_ciphers) - 1);
+  }
   if (cipher_accepted) {
-    if (strcmp(options->cipherstring, CIPHERSUITE_LIST_ALL) && strcmp(options->cipherstring, TLSV13_CIPHERSUITES)) {
+    if (!isInitialCipherList(options)) {
       printf_xml("accepted\"");
       printf("Accepted  ");
     }
@@ -3366,10 +3409,17 @@ int testProtocolCiphers(struct sslCheckOptions *options, const SSL_METHOD *sslMe
     int status;
     status = true;
 
+    /* TLSv1.3 has no RC4, 3DES or single-DES ciphersuites, so there is nothing to test here. */
+    if (sslMethod == TLSv1_3_client_method() && (options->onlyRC4 || options->only3DES || options->onlyDES))
+    {
+        printf("  Skipping TLSv1.3 (no RC4, 3DES or DES ciphersuites exist in TLSv1.3).\n");
+        return true;
+    }
+
     if (sslMethod == TLSv1_3_client_method())
       strncpy(options->cipherstring, TLSV13_CIPHERSUITES, sizeof(options->cipherstring));
     else
-      strncpy(options->cipherstring, CIPHERSUITE_LIST_ALL, sizeof(options->cipherstring));
+      getInitialCipherList(options, options->cipherstring, sizeof(options->cipherstring));
 
     // Loop until the server won't accept any more ciphers
     while (status == true)
@@ -3421,12 +3471,73 @@ int testProtocolCiphers(struct sslCheckOptions *options, const SSL_METHOD *sslMe
     return true;
 }
 
+/* Appends an item to a separator-joined list buffer. */
+static void append_list_item(char *buf, size_t buflen, const char *sep, const char *item) {
+    if (buf[0] != '\0')
+        strncat(buf, sep, buflen - strlen(buf) - 1);
+    strncat(buf, item, buflen - strlen(buf) - 1);
+}
+
+/* Prints "host:port, " (bracketing IPv6 hosts) using fprintf so that it is
+ * not suppressed in --oneline mode. */
+static void print_host_port(struct sslCheckOptions *options) {
+    if (strchr(options->host, ':') != NULL)
+        fprintf(stdout, "[%s]:%d, ", options->host, options->port);
+    else
+        fprintf(stdout, "%s:%d, ", options->host, options->port);
+}
+
+/* Prints the one-line per-host summary for --oneline mode.  With cipher
+ * filters (--rc4/--3des/--des) the line lists the accepted ciphers;
+ * otherwise it lists the supported protocols.  Hosts with no findings
+ * produce no output. */
+void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, int ssl3_supported) {
+    if (options->onlyRC4 || options->only3DES || options->onlyDES) {
+        char filters[32] = "";
+        if (options->oneline_ciphers[0] == '\0')
+            return;
+        if (options->onlyRC4)
+            append_list_item(filters, sizeof(filters), "+", "rc4");
+        if (options->only3DES)
+            append_list_item(filters, sizeof(filters), "+", "3des");
+        if (options->onlyDES)
+            append_list_item(filters, sizeof(filters), "+", "des");
+        print_host_port(options);
+        fprintf(stdout, "%s: %s\n", filters, options->oneline_ciphers);
+    } else {
+        char protocols[128] = "";
+        if (ssl2_supported)
+            append_list_item(protocols, sizeof(protocols), ",", "SSLv2");
+        if (ssl3_supported)
+            append_list_item(protocols, sizeof(protocols), ",", "SSLv3");
+        if (options->tls10_supported)
+            append_list_item(protocols, sizeof(protocols), ",", "TLSv1.0");
+        if (options->tls11_supported)
+            append_list_item(protocols, sizeof(protocols), ",", "TLSv1.1");
+        if (options->tls12_supported)
+            append_list_item(protocols, sizeof(protocols), ",", "TLSv1.2");
+        if (options->tls13_supported)
+            append_list_item(protocols, sizeof(protocols), ",", "TLSv1.3");
+        if (protocols[0] == '\0')
+            return;
+        print_host_port(options);
+        fprintf(stdout, "%s\n", protocols);
+    }
+}
+
 // Test a single host and port for ciphers...
 int testHost(struct sslCheckOptions *options)
 {
     // Variables...
     struct sslCipher *sslCipherPointer = NULL;
     int status = true;
+    int ssl2_supported = false;
+    int ssl3_supported = false;
+
+    // Reset the one-line cipher collection (the options struct is reused
+    // across hosts in multi-target mode).
+    if (options->oneline)
+        options->oneline_ciphers[0] = '\0';
     
     // XML Output...
     printf_xml(" <ssltest host=\"%s\" sniname=\"%s\" port=\"%d\">\n", options->host, options->sniname, options->port);
@@ -3444,7 +3555,8 @@ int testHost(struct sslCheckOptions *options)
 
     // Check if SSLv2 is enabled.
     if ((options->sslVersion == ssl_all) || (options->sslVersion == ssl_v2)) {
-      if (runSSLv2Test(options)) {
+      ssl2_supported = runSSLv2Test(options);
+      if (ssl2_supported) {
         printf("SSLv2     %senabled%s\n", COL_RED, RESET);
         printf_xml("  <protocol type=\"ssl\" version=\"2\" enabled=\"1\" />\n");
       } else {
@@ -3455,7 +3567,8 @@ int testHost(struct sslCheckOptions *options)
 
     // Check if SSLv3 is enabled.
     if ((options->sslVersion == ssl_all) || (options->sslVersion == ssl_v3)) {
-      if (runSSLv3Test(options)) {
+      ssl3_supported = runSSLv3Test(options);
+      if (ssl3_supported) {
 	printf("SSLv3     %senabled%s\n", COL_RED, RESET);
 	printf_xml("  <protocol type=\"ssl\" version=\"3\" enabled=\"1\" />\n");
       } else {
@@ -3506,7 +3619,7 @@ int testHost(struct sslCheckOptions *options)
     }
     printf("\n");
 
-    if (options->showClientCiphers == true)
+    if (options->showClientCiphers == true && !options->oneline)
     {
         // Build a list of ciphers...
         switch (options->sslVersion)
@@ -3547,24 +3660,24 @@ int testHost(struct sslCheckOptions *options)
         }
         printf("\n");
     }
-    if (status == true && options->fallback )
+    if (status == true && options->fallback && !options->oneline)
     {
         printf("  %sTLS Fallback SCSV:%s\n", COL_BLUE, RESET);
         testFallback(options, NULL);
     }
-    if (status == true && options->reneg )
+    if (status == true && options->reneg && !options->oneline)
     {
         printf("  %sTLS renegotiation:%s\n", COL_BLUE, RESET);
         testRenegotiation(options, TLSv1_client_method());
     }
 
-    if (status == true && options->compression )
+    if (status == true && options->compression && !options->oneline)
     {
         printf("  %sTLS Compression:%s\n", COL_BLUE, RESET);
         testCompression(options, TLSv1_client_method());
     }
 
-    if (status == true && options->heartbleed )
+    if (status == true && options->heartbleed && !options->oneline)
     {
         printf("  %sHeartbleed:%s\n", COL_BLUE, RESET);
         if ((options->sslVersion == ssl_all || options->sslVersion == tls_all || options->sslVersion == tls_v13) && options->tls13_supported)
@@ -3595,7 +3708,7 @@ int testHost(struct sslCheckOptions *options)
     }
 
 	// Print OCSP response
-	if (status == true && options->ocspStatus == true)
+	if (status == true && options->ocspStatus == true && !options->oneline)
 	{
 		printf("  %sOCSP Stapling Request:%s\n", COL_BLUE, RESET);
 		status = ocspRequest(options);
@@ -3638,15 +3751,15 @@ int testHost(struct sslCheckOptions *options)
     }
 
     // Enumerate key exchange groups.
-    if (options->groups)
+    if (options->groups && !options->oneline)
         testSupportedGroups(options);
 
     // Enumerate signature algorithms.
-    if (options->signature_algorithms)
+    if (options->signature_algorithms && !options->oneline)
         testSignatureAlgorithms(options);
 
     // Certificate checks
-    if (status == true && (options->showCertificate == true || options->checkCertificate == true))
+    if (status == true && (options->showCertificate == true || options->checkCertificate == true) && !options->oneline)
     {
         printf_xml(" <certificates>\n");
 
@@ -3674,10 +3787,15 @@ int testHost(struct sslCheckOptions *options)
     }
 
     // Print client auth trusted CAs
-    if (options->showTrustedCAs == true)
+    if (options->showTrustedCAs == true && !options->oneline)
     {
         status = showTrustedCAs(options);
     }
+
+    // One-line summary (also printed when earlier checks failed, so that
+    // every host gets exactly one line).
+    if (options->oneline)
+        printOneLineSummary(options, ssl2_supported, ssl3_supported);
 
     // XML Output...
     printf_xml(" </ssltest>\n");
@@ -3982,6 +4100,26 @@ int main(int argc, char *argv[])
         else if (strcmp("--tls13", argv[argLoop]) == 0)
             options->sslVersion = tls_v13;
 
+        // RC4 ciphers only...
+        else if (strcmp("--rc4", argv[argLoop]) == 0)
+            options->onlyRC4 = true;
+
+        // 3DES ciphers only...
+        else if (strcmp("--3des", argv[argLoop]) == 0)
+            options->only3DES = true;
+
+        // DES (single DES) ciphers only...
+        else if (strcmp("--des", argv[argLoop]) == 0)
+            options->onlyDES = true;
+
+        // One-line output (one "host:port, result" line per host, skipping
+        // the renegotiation/compression/heartbleed/groups/certificate checks)...
+        else if (strcmp("--oneline", argv[argLoop]) == 0)
+        {
+            options->oneline = true;
+            oneline_output = 1;
+        }
+
         // TLS (all versions)...
         else if (strcmp("--tlsall", argv[argLoop]) == 0)
             options->sslVersion = tls_all;
@@ -4201,6 +4339,12 @@ int main(int argc, char *argv[])
             printf("  %s--tls12%s              Only check TLSv1.2 ciphers\n", COL_GREEN, RESET);
             printf("  %s--tls13%s              Only check TLSv1.3 ciphers\n", COL_GREEN, RESET);
             printf("  %s--tlsall%s             Only check TLS ciphers (all versions)\n", COL_GREEN, RESET);
+            printf("  %s--rc4%s                Only check RC4 ciphers\n", COL_GREEN, RESET);
+            printf("  %s--3des%s               Only check triple-DES (3DES) ciphers\n", COL_GREEN, RESET);
+            printf("  %s--des%s                Only check single-DES (DES) ciphers\n", COL_GREEN, RESET);
+            printf("  %s--oneline%s            Print one line per host with findings (host:port, result);\n", COL_GREEN, RESET);
+            printf("                       hosts with no findings are silent; skips renegotiation,\n");
+            printf("                       compression, heartbleed, groups and certificate checks\n");
             printf("  %s--show-ciphers%s       Show supported client ciphers\n", COL_GREEN, RESET);
             printf("  %s--show-cipher-ids%s    Show cipher ids\n", COL_GREEN, RESET);
             printf("  %s--iana-names%s         Use IANA/RFC cipher names rather than OpenSSL ones\n", COL_GREEN, RESET);
@@ -4254,6 +4398,11 @@ int main(int argc, char *argv[])
                 if (testConnection(options))
                 {
                     testHost(options);
+                }
+                else if (options->oneline)
+                {
+                    print_host_port(options);
+                    fprintf(stdout, "ERROR: connection failed\n");
                 }
             }
             else
@@ -4318,6 +4467,11 @@ int main(int argc, char *argv[])
                                 if (testConnection(options))
                                 {
                                     testHost(options);
+                                }
+                                else if (options->oneline)
+                                {
+                                    print_host_port(options);
+                                    fprintf(stdout, "ERROR: connection failed\n");
                                 }
                                 printf("\n\n");
                             }
@@ -5170,8 +5324,9 @@ bs *makeCiphersuiteListAll(unsigned int tls_version) {
 }
 
 
-/* Returns a byte string with a list of all missing ciphersuites for a given TLS version (TLSv1_? constant) .*/
-bs *makeCiphersuiteListMissing(unsigned int tls_version) {
+/* Returns a byte string with a list of all missing ciphersuites for a given TLS version (TLSv1_? constant).
+ * When --rc4, --3des and/or --des is used, only ciphersuites matching the requested bulk cipher(s) are included. */
+bs *makeCiphersuiteListMissing(struct sslCheckOptions *options, unsigned int tls_version) {
   bs *ciphersuite_list = NULL;
 
   bs_new_size(&ciphersuite_list, 1024);
@@ -5186,7 +5341,15 @@ bs *makeCiphersuiteListMissing(unsigned int tls_version) {
   for (int i = 0; i < (sizeof(missing_ciphersuites) / sizeof(struct missing_ciphersuite)); i++) {
     /* Append only those that OpenSSL does not cover, and those that were not already accepted through a previous run. */
     if ((missing_ciphersuites[i].check_tls_versions & tls_version) && ((missing_ciphersuites[i].accepted_tls_versions & tls_version) == 0)) {
-      bs_append_ushort(ciphersuite_list, missing_ciphersuites[i].id);
+      if (options->onlyRC4 || options->only3DES || options->onlyDES) {
+        int isRC4 = (strstr(missing_ciphersuites[i].protocol_name, "RC4") != NULL);
+        int is3DES = (strstr(missing_ciphersuites[i].protocol_name, "3DES") != NULL);
+        int isDES = (!is3DES && (strstr(missing_ciphersuites[i].protocol_name, "DES") != NULL));
+        if ((options->onlyRC4 && isRC4) || (options->only3DES && is3DES) || (options->onlyDES && isDES))
+          bs_append_ushort(ciphersuite_list, missing_ciphersuites[i].id);
+      } else {
+        bs_append_ushort(ciphersuite_list, missing_ciphersuites[i].id);
+      }
     }
   }
 
@@ -5548,7 +5711,7 @@ int testMissingCiphers(struct sslCheckOptions *options, unsigned int tls_version
     tlsExtensionUpdateLength(tls_extensions);
 
     /* Construct the list of all ciphersuites not implemented by OpenSSL. */
-    ciphersuite_list = makeCiphersuiteListMissing(tls_version);
+    ciphersuite_list = makeCiphersuiteListMissing(options, tls_version);
 
     client_hello = makeClientHello(options, tls_version, ciphersuite_list, tls_extensions);
     bs_free(&tls_extensions);

@@ -103,6 +103,28 @@ Only check TLS 1.3 ciphers
 .br
 Only check TLS ciphers (versions 1.0, 1.1, 1.2, and 1.3)
 .TP
+.B \-\-rc4
+.br
+Only check RC4 ciphers. Can be combined with the protocol options (e.g. \-\-tls12) and with \-\-3des and \-\-des
+.TP
+.B \-\-3des
+.br
+Only check triple-DES (3DES) ciphers. Can be combined with the protocol options (e.g. \-\-tls12) and with \-\-rc4 and \-\-des
+.TP
+.B \-\-des
+.br
+Only check single-DES (DES) ciphers. Can be combined with the protocol options (e.g. \-\-tls12) and with \-\-rc4 and \-\-3des
+.TP
+.B \-\-oneline
+.br
+Print one line per host with findings (host:port, result) instead of the
+full report.
+With \-\-rc4, \-\-3des or \-\-des the line lists the accepted ciphers;
+otherwise it lists the supported protocols. Hosts with no findings produce
+no output. Renegotiation,
+compression, heartbleed, group and certificate checks are skipped.
+Unreachable hosts are reported as ERROR.
+.TP
 .B \-\-ocsp
 .br
 Display OCSP status

@@ -72,8 +72,18 @@
 /* Cipherlist for TLSv1.2 and below that corresponds to all available ciphersuites. */
 #define CIPHERSUITE_LIST_ALL "ALL:COMPLEMENTOFALL"
 
+/* Cipherlists used by the --rc4, --3des and --des options to test only RC4,
+ * triple-DES or single-DES ciphersuites.  Combining options uses the union
+ * of the selected lists (e.g. "RC4:3DES"). */
+#define CIPHERSUITE_LIST_RC4 "RC4"
+#define CIPHERSUITE_LIST_3DES "3DES"
+#define CIPHERSUITE_LIST_DES "DES"
+
 // Macros for various outputs
-#define printf(format, ...)         if (!xml_to_stdout) fprintf(stdout, format, ##__VA_ARGS__)
+/* In --oneline mode (oneline_output != 0), regular console output is
+ * suppressed; only the one-line summary per host (via fprintf) and errors
+ * are shown.  XML output is unaffected. */
+#define printf(format, ...)         if (!xml_to_stdout && !oneline_output) fprintf(stdout, format, ##__VA_ARGS__)
 #define printf_xml(format, ...)     if (options->xmlOutput) fprintf(options->xmlOutput, format, ##__VA_ARGS__)
 #define printf_verbose(format, ...) if (options->verbose) printf(format, ##__VA_ARGS__)
 
@@ -176,6 +186,11 @@ struct sslCheckOptions
     int starttls_psql;
     int xmpp_server;
     int sslVersion;
+    int onlyRC4;
+    int only3DES;
+    int onlyDES;
+    int oneline;
+    char oneline_ciphers[65536];
     int targets;
     int sslbugs;
     int rdp;
@@ -327,7 +342,7 @@ char *getPrintableTLSName(unsigned int tls_version);
 bs *getServerHello(int s);
 bs *makeCiphersuiteListAll(unsigned int tls_version);
 bs *makeCiphersuiteListTLS13All();
-bs *makeCiphersuiteListMissing(unsigned int tls_version);
+bs *makeCiphersuiteListMissing(struct sslCheckOptions *options, unsigned int tls_version);
 bs *makeClientHello(struct sslCheckOptions *options, unsigned int version, bs *ciphersuite_list, bs *tls_extensions);
 bs *makeTLSExtensions(struct sslCheckOptions *options, unsigned int include_signature_algorithms);
 void markFoundCiphersuite(unsigned short server_cipher_id, unsigned int tls_version);

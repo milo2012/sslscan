@@ -1613,9 +1613,9 @@ char *cipherRemove(char *str, const char *sub) {
 }
 
 /* Builds the initial cipherstring for cipher enumeration into buf.  When
- * --rc4, --3des and/or --des is used, only the requested bulk cipher(s) are
- * included (combined as a union); otherwise all available ciphersuites are
- * used. */
+ * --rc4, --3des, --des and/or --anon is used, only the requested bulk
+ * cipher(s) are included (combined as a union); otherwise all available
+ * ciphersuites are used. */
 void getInitialCipherList(struct sslCheckOptions *options, char *buf, size_t buflen) {
     buf[0] = '\0';
     if (options->onlyRC4)
@@ -1629,6 +1629,11 @@ void getInitialCipherList(struct sslCheckOptions *options, char *buf, size_t buf
         if (buf[0] != '\0')
             strncat(buf, ":", buflen - strlen(buf) - 1);
         strncat(buf, CIPHERSUITE_LIST_DES, buflen - strlen(buf) - 1);
+    }
+    if (options->onlyAnon) {
+        if (buf[0] != '\0')
+            strncat(buf, ":", buflen - strlen(buf) - 1);
+        strncat(buf, CIPHERSUITE_LIST_ANON, buflen - strlen(buf) - 1);
     }
     if (buf[0] == '\0')
         strncpy(buf, CIPHERSUITE_LIST_ALL, buflen);
@@ -1644,6 +1649,92 @@ int isInitialCipherList(struct sslCheckOptions *options) {
     return strcmp(options->cipherstring, initial) == 0;
 }
 
+/* Appends an item to a separator-joined list buffer. */
+static void append_list_item(char *buf, size_t buflen, const char *sep, const char *item) {
+    if (buf[0] != '\0')
+        strncat(buf, sep, buflen - strlen(buf) - 1);
+    strncat(buf, item, buflen - strlen(buf) - 1);
+}
+
+/* Appends an item to a separator-joined list buffer unless the exact token
+ * is already present. Used for one-line collections gathered across multiple
+ * protocol versions, where each version can report the same finding
+ * (substring matching would wrongly merge e.g. DES-CBC3-SHA into
+ * ECDHE-RSA-DES-CBC3-SHA). */
+static void append_unique_item(char *buf, size_t buflen, const char *sep, const char *item) {
+    size_t itemlen = strlen(item);
+    size_t seplen = strlen(sep);
+    const char *p = buf;
+    const char *hit;
+    while ((hit = strstr(p, item)) != NULL) {
+        int at_start = (hit == buf) || (seplen > 0 && hit >= buf + seplen && memcmp(hit - seplen, sep, seplen) == 0);
+        int at_end = (hit[itemlen] == '\0') || (seplen > 0 && strncmp(hit + itemlen, sep, seplen) == 0);
+        if (at_start && at_end)
+            return;
+        p = hit + (itemlen > 0 ? itemlen : 1);
+    }
+    append_list_item(buf, buflen, sep, item);
+}
+
+/* Formats an ASN1_TIME into buf as YYYY-MM-DD (e.g. "2026-09-19").
+ * Returns true on success, false if the time could not be converted
+ * (buf is left empty in that case). */
+static int format_asn1_date(const ASN1_TIME *t, char *buf, size_t buflen) {
+    struct tm tm;
+    buf[0] = '\0';
+    if (t == NULL)
+        return false;
+    if (!ASN1_TIME_to_tm(t, &tm))
+        return false;
+    if (strftime(buf, buflen, "%Y-%m-%d", &tm) == 0)
+    {
+        buf[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+/* Builds a self-signed finding item: "self-signed: <subject>", with
+ * " (issuer: <issuer>)" appended when the issuer differs from the subject
+ * (the hostname/"*" heuristic cases). */
+static void build_self_signed_item(char *item, size_t itemlen, const char *subject, const char *issuer) {
+    if (subject == NULL)
+        subject = "unknown";
+    if (issuer != NULL && strcmp(issuer, subject) != 0)
+        snprintf(item, itemlen, "self-signed: %.200s (issuer: %.200s)", subject, issuer);
+    else
+        snprintf(item, itemlen, "self-signed: %.400s", subject);
+}
+
+/* Returns the finite-field DH modulus bits negotiated on the connection,
+ * or -1 when the cipher does not use finite-field DH (RSA/ECDSA key
+ * exchange, ECDHE, TLS 1.3, ...). */
+int getFiniteFieldDHBts(SSL *ssl) {
+#ifndef LIBRESSL_VERSION_NUMBER
+    EVP_PKEY *key = NULL;
+    int bits = -1;
+    if (ssl != NULL && SSL_get_server_tmp_key(ssl, &key) && key != NULL)
+    {
+        if (EVP_PKEY_id(key) == EVP_PKEY_DH)
+            bits = EVP_PKEY_bits(key);
+        EVP_PKEY_free(key);
+    }
+    return bits;
+#else
+    (void)ssl;
+    return -1;
+#endif
+}
+
+/* Returns true for IANA ciphersuite names using (finite-field) DH key
+ * exchange: DHE_*, DH_*, DH_anon_*, but never ECDH/ECDHE_* (elliptic curves
+ * are not affected by Logjam). */
+int isDHECiphersuiteName(const char *name) {
+    if (name == NULL || strstr(name, "ECDH") != NULL)
+        return false;
+    return (strstr(name, "DHE") != NULL || strstr(name, "_DH_") != NULL);
+}
+
 /* Outputs an accepted cipher to the console and XML file. */
 void outputCipher(struct sslCheckOptions *options, SSL *ssl, const char *cleanSslMethod, uint32_t cipherid, const char *ciphername, int cipherbits, int cipher_accepted, unsigned int milliseconds_elapsed) {
   char hexCipherId[8] = {0};
@@ -1656,9 +1747,21 @@ void outputCipher(struct sslCheckOptions *options, SSL *ssl, const char *cleanSs
     /* In one-line mode, collect the accepted cipher for the summary instead
      * of printing the full details here (console output is suppressed; the
      * XML output below stays identical to a normal run). */
-    if (options->oneline_ciphers[0] != '\0')
-      strncat(options->oneline_ciphers, ",", sizeof(options->oneline_ciphers) - strlen(options->oneline_ciphers) - 1);
-    strncat(options->oneline_ciphers, ciphername, sizeof(options->oneline_ciphers) - strlen(options->oneline_ciphers) - 1);
+    if (options->onlyDH1024 && ssl != NULL)
+    {
+        /* In --dh1024 mode, collect the cipher with its measured DH size. */
+        int dhbits = getFiniteFieldDHBts(ssl);
+        if (dhbits > 0)
+        {
+            char item[128];
+            snprintf(item, sizeof(item), "%.90s (%d)", ciphername, dhbits);
+            append_unique_item(options->oneline_ciphers, sizeof(options->oneline_ciphers), ", ", item);
+        }
+        else
+            append_unique_item(options->oneline_ciphers, sizeof(options->oneline_ciphers), ", ", ciphername);
+    }
+    else
+        append_unique_item(options->oneline_ciphers, sizeof(options->oneline_ciphers), ", ", ciphername);
   }
   if (cipher_accepted) {
     if (!isInitialCipherList(options)) {
@@ -1905,7 +2008,12 @@ int testCipher(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
 		  milliseconds_elapsed = tval_elapsed.tv_sec * 1000 + (int)tval_elapsed.tv_usec / 1000;
 		}
 
-                outputCipher(options, ssl, cleanSslMethod, cipherid, ciphername, cipherbits, 1, milliseconds_elapsed);
+                /* In --dh1024 mode, only report DHE ciphers with weak
+                 * (<= 1024 bit) DH params. Exclusion below still runs so
+                 * enumeration continues. */
+                int dhBits = getFiniteFieldDHBts(ssl);
+                if (!options->onlyDH1024 || (dhBits > 0 && dhBits <= 1024))
+                    outputCipher(options, ssl, cleanSslMethod, cipherid, ciphername, cipherbits, 1, milliseconds_elapsed);
 
                 // Disconnect SSL over socket
                 const char *usedcipher = SSL_get_cipher_name(ssl);
@@ -1942,6 +2050,89 @@ int testCipher(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
 
 
     return status;
+}
+
+/* Verification callback for --cert-untrusted. Always succeeds so that the
+ * handshake completes even for untrusted chains; the real result is read
+ * afterwards with SSL_get_verify_result() and reported as a finding instead
+ * of aborting the connection. */
+static int always_succeed_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
+{
+    (void)preverify_ok;
+    (void)ctx;
+    return 1;
+}
+
+/* Returns the number of CA objects currently in the context's trust store. */
+static int trust_store_count(SSL_CTX *ctx)
+{
+    STACK_OF(X509_OBJECT) *objs = X509_STORE_get0_objects(SSL_CTX_get_cert_store(ctx));
+    return (objs != NULL) ? sk_X509_OBJECT_num(objs) : 0;
+}
+
+static int path_exists(const char *p)
+{
+    return (p != NULL && access(p, R_OK) == 0);
+}
+
+/* Do the OpenSSL default trust locations actually exist on disk (including
+ * SSL_CERT_FILE/SSL_CERT_DIR overrides)? Used to tell a lazily-loaded but
+ * valid default store apart from compiled-in paths that point nowhere
+ * (e.g. static builds), where set_default_verify_paths() still succeeds. */
+static int default_trust_paths_exist(void)
+{
+    const char *e;
+    if ((e = getenv("SSL_CERT_FILE")) != NULL && path_exists(e))
+        return true;
+    if ((e = getenv("SSL_CERT_DIR")) != NULL && path_exists(e))
+        return true;
+    if (path_exists(X509_get_default_cert_file()))
+        return true;
+    if (path_exists(X509_get_default_cert_dir()))
+        return true;
+    return false;
+}
+
+/* Loads CA certificates for chain validation (--cert-untrusted) from the
+ * OpenSSL default paths plus well-known system bundle locations (Debian,
+ * RHEL, Alpine, macOS, Homebrew). Returns true if a usable (non-empty)
+ * store was built. Note: SSL_CTX_set_default_verify_paths() can report
+ * success with an empty store (e.g. static builds whose compiled-in paths
+ * don't exist), so explicit locations are tried as well. */
+int setupTrustStore(SSL_CTX *ctx)
+{
+    static const char *caFiles[] = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+        "/opt/homebrew/etc/openssl@3/cert.pem",
+        "/usr/local/etc/openssl/cert.pem",
+        NULL
+    };
+    static const char *caPaths[] = {
+        "/etc/ssl/certs",
+        "/etc/pki/tls/certs",
+        NULL
+    };
+    int i;
+    int have_default = (SSL_CTX_set_default_verify_paths(ctx) == 1);
+
+    if (have_default && trust_store_count(ctx) > 0)
+        return true;
+    for (i = 0; caFiles[i] != NULL; i++)
+    {
+        if (SSL_CTX_load_verify_locations(ctx, caFiles[i], NULL) == 1 && trust_store_count(ctx) > 0)
+            return true;
+    }
+    for (i = 0; caPaths[i] != NULL; i++)
+    {
+        if (SSL_CTX_load_verify_locations(ctx, NULL, caPaths[i]) == 1 && trust_store_count(ctx) > 0)
+            return true;
+    }
+    /* Last resort: default paths may load lazily (hashed directories), in
+     * which case the store looks empty but still works. Only accept that
+     * when the locations really exist. */
+    return (have_default && default_trust_paths_exist());
 }
 
 int checkCertificateProtocol(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
@@ -1990,6 +2181,8 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
     X509_EXTENSION *extension = NULL;
     const X509_ALGOR *palg = NULL;
     const ASN1_OBJECT *paobj = NULL;
+    int certFilter = (options->onlyCertMD5 || options->onlyCertSHA1 || options->onlyCertShortRSA || options->onlyCertExpired || options->onlyCertExpiring || options->onlyCertSelfSigned || options->onlyCertUntrusted);
+    const char *certSubject = NULL;
 
     // Connect to host
     socketDescriptor = tcpConnect(options);
@@ -2034,6 +2227,23 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                         // Against some servers, this is required for a successful SSL_connect(), below.
                         SSL_set_options(ssl, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
 
+                        // Enable chain validation for --cert-untrusted. A missing
+                        // CA store is reported once (see trustStoreState) and the
+                        // check is then skipped instead of flagging everything.
+                        if (options->onlyCertUntrusted && options->trustStoreState != -1)
+                        {
+                            if (setupTrustStore(options->ctx))
+                            {
+                                options->trustStoreState = 1;
+                                SSL_set_verify(ssl, SSL_VERIFY_PEER, always_succeed_verify_callback);
+                            }
+                            else if (options->trustStoreState == 0)
+                            {
+                                options->trustStoreState = -1;
+                                printf_error("Could not load CA certificates for --cert-untrusted; trust checks skipped.");
+                            }
+                        }
+
                         // Connect SSL over socket
                         SSL_connect(ssl);
                         // Setup BIO's
@@ -2068,22 +2278,41 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                             // Signature Algo...
                             if (!(X509_FLAG_COMPAT & X509_FLAG_NO_SIGNAME))
                             {
-                                printf("Signature Algorithm: ");
                                 X509_get0_signature(NULL, &palg, x509Cert);
                                 X509_ALGOR_get0(&paobj, NULL, NULL, palg);
                                 OBJ_obj2txt(certAlgorithm, sizeof(certAlgorithm), paobj, 0);
                                 strtok(certAlgorithm, "\n");
-                                if (strstr(certAlgorithm, "md5") || strstr(certAlgorithm, "sha1"))
+                                int isMD5 = (strstr(certAlgorithm, "md5") != NULL);
+                                int isSHA1 = (strstr(certAlgorithm, "sha1") != NULL);
+                                if (options->oneline)
                                 {
-                                    printf("%s%s%s\n", COL_RED, certAlgorithm, RESET);
+                                    char item[128];
+                                    if (options->onlyCertMD5 && isMD5)
+                                    {
+                                        snprintf(item, sizeof(item), "MD5: %s", certAlgorithm);
+                                        append_unique_item(options->oneline_cert, sizeof(options->oneline_cert), ", ", item);
+                                    }
+                                    if (options->onlyCertSHA1 && isSHA1)
+                                    {
+                                        snprintf(item, sizeof(item), "SHA1: %s", certAlgorithm);
+                                        append_unique_item(options->oneline_cert, sizeof(options->oneline_cert), ", ", item);
+                                    }
                                 }
-                                else if (strstr(certAlgorithm, "sha512") || strstr(certAlgorithm, "sha256"))
+                                if (!certFilter || (options->onlyCertMD5 && isMD5) || (options->onlyCertSHA1 && isSHA1))
                                 {
-                                    printf("%s%s%s\n", COL_GREEN, certAlgorithm, RESET);
-                                }
-                                else
-                                {
-                                    printf("%s\n", certAlgorithm);
+                                    printf("Signature Algorithm: ");
+                                    if (isMD5 || isSHA1)
+                                    {
+                                        printf("%s%s%s\n", COL_RED, certAlgorithm, RESET);
+                                    }
+                                    else if (strstr(certAlgorithm, "sha512") || strstr(certAlgorithm, "sha256"))
+                                    {
+                                        printf("%s%s%s\n", COL_GREEN, certAlgorithm, RESET);
+                                    }
+                                    else
+                                    {
+                                        printf("%s\n", certAlgorithm);
+                                    }
                                 }
 
                                 if (options->xmlOutput)
@@ -2109,20 +2338,30 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                                         case EVP_PKEY_RSA:
                                             if (EVP_PKEY_get1_RSA(publicKey)!=NULL)
                                             {
-                                                if (keyBits < 2048 )
+                                                if (!certFilter || (options->onlyCertShortRSA && keyBits < 2048))
                                                 {
-                                                    printf("RSA Key Strength:    %s%d%s\n", COL_RED, keyBits, RESET);
-                                                }
-                                                else if (keyBits >= 3072 )
-                                                {
-                                                    printf("RSA Key Strength:    %s%d%s\n", COL_GREEN, keyBits, RESET);
-                                                }
-                                                else
-                                                {
-                                                    printf("RSA Key Strength:    %d\n", keyBits);
+                                                    if (keyBits < 2048 )
+                                                    {
+                                                        printf("RSA Key Strength:    %s%d%s\n", COL_RED, keyBits, RESET);
+                                                    }
+                                                    else if (keyBits >= 3072 )
+                                                    {
+                                                        printf("RSA Key Strength:    %s%d%s\n", COL_GREEN, keyBits, RESET);
+                                                    }
+                                                    else
+                                                    {
+                                                        printf("RSA Key Strength:    %d\n", keyBits);
+                                                    }
                                                 }
 
                                                 printf_xml("   <pk error=\"false\" type=\"RSA\" bits=\"%d\" />\n", keyBits);
+
+                                                if (options->oneline && options->onlyCertShortRSA && keyBits < 2048)
+                                                {
+                                                    char item[32];
+                                                    snprintf(item, sizeof(item), "short-rsa: %d", keyBits);
+                                                    append_unique_item(options->oneline_cert, sizeof(options->oneline_cert), ", ", item);
+                                                }
                                             }
                                             else
                                             {
@@ -2159,8 +2398,11 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                                                     else if (keyBits < 128)
                                                         color = COL_YELLOW;
 
-                                                    printf("ECC Curve Name:      %s\n", ec_group_name);
-                                                    printf("ECC Key Strength:    %s%d%s\n\n", color, keyBits, RESET);
+                                                    if (!(options->onlyCertMD5 || options->onlyCertSHA1 || options->onlyCertShortRSA))
+                                                    {
+                                                        printf("ECC Curve Name:      %s\n", ec_group_name);
+                                                        printf("ECC Key Strength:    %s%d%s\n\n", color, keyBits, RESET);
+                                                    }
                                                     printf_xml("   <pk error=\"false\" type=\"EC\" curve_name=\"%s\" bits=\"%d\" />\n", ec_group_name, keyBits);
                                                     EC_KEY_free(ec_key); ec_key = NULL;
                                                 }
@@ -2210,6 +2452,9 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                                     printf_xml("   <subject><![CDATA[%s]]></subject>\n", subject);
                                 }
 
+                                /* Remember the subject for one-line findings below. */
+                                certSubject = subject;
+
                                 // Get certificate altnames if supported
                                 if (!(X509_FLAG_COMPAT & X509_FLAG_NO_EXTENSIONS))
                                 {
@@ -2220,10 +2465,13 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                                         {
                                             extension = X509v3_get_ext(X509_get0_extensions(x509Cert),cnindex);
 
-                                            printf("Altnames: ");
-                                            if (!X509V3_EXT_print(stdoutBIO, extension, X509_FLAG_COMPAT, 0))
+                                            if (!certFilter)
                                             {
-                                                ASN1_STRING_print(stdoutBIO, X509_EXTENSION_get_data(extension));
+                                                printf("Altnames: ");
+                                                if (!X509V3_EXT_print(stdoutBIO, extension, X509_FLAG_COMPAT, 0))
+                                                {
+                                                    ASN1_STRING_print(stdoutBIO, X509_EXTENSION_get_data(extension));
+                                                }
                                             }
                                             if (options->xmlOutput)
                                             {
@@ -2232,7 +2480,8 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                                                     ASN1_STRING_print(fileBIO, X509_EXTENSION_get_data(extension));
                                             }
                                             printf_xml("]]></altnames>\n");
-                                            printf("\n");
+                                            if (!certFilter)
+                                                printf("\n");
                                         }
                                     }
                                 }
@@ -2258,6 +2507,12 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
 
                                     if (self_signed) {
                                         printf_xml("   <self-signed>true</self-signed>\n");
+                                        if (options->oneline && options->onlyCertSelfSigned)
+                                        {
+                                            char item[512];
+                                            build_self_signed_item(item, sizeof(item), subject, issuer);
+                                            append_unique_item(options->oneline_cert, sizeof(options->oneline_cert), ", ", item);
+                                        }
                                     }
                                     else {
                                         printf_xml("   <self-signed>false</self-signed>\n");
@@ -2279,6 +2534,12 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                                         printf("Issuer:   %s%s%s\n", COL_RED, issuer, RESET);
                                         printf_xml("   <issuer><![CDATA[%s]]></issuer>\n", issuer);
                                         printf_xml("   <self-signed>true</self-signed>\n");
+                                        if (options->oneline && options->onlyCertSelfSigned)
+                                        {
+                                            char item[512];
+                                            build_self_signed_item(item, sizeof(item), subject, issuer);
+                                            append_unique_item(options->oneline_cert, sizeof(options->oneline_cert), ", ", item);
+                                        }
 
                                     }
                                     else
@@ -2295,19 +2556,22 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                             int timediff;
                             ptime = NULL;
 
-                            printf("\nNot valid before: ");
                             timediff = X509_cmp_time(X509_get0_notBefore(x509Cert), ptime);
-                            // Certificate isn't valid yet
-                            if (timediff > 0)
+                            if (!certFilter)
                             {
-                                printf("%s", COL_RED);
+                                printf("\nNot valid before: ");
+                                // Certificate isn't valid yet
+                                if (timediff > 0)
+                                {
+                                    printf("%s", COL_RED);
+                                }
+                                else
+                                {
+                                    printf("%s", COL_GREEN);
+                                }
+                                ASN1_TIME_print(stdoutBIO, X509_get0_notBefore(x509Cert));
+                                printf("%s", RESET);
                             }
-                            else
-                            {
-                                printf("%s", COL_GREEN);
-                            }
-                            ASN1_TIME_print(stdoutBIO, X509_get0_notBefore(x509Cert));
-                            printf("%s", RESET);
 
                             if (options->xmlOutput) {
                                 printf_xml("   <not-valid-before>");
@@ -2323,19 +2587,22 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                                 }
                             }
 
-                            printf("\nNot valid after:  ");
                             timediff = X509_cmp_time(X509_get0_notAfter(x509Cert), ptime);
-                            // Certificate has expired
-                            if (timediff < 0)
+                            if (!certFilter)
                             {
-                                printf("%s", COL_RED);
+                                printf("\nNot valid after:  ");
+                                // Certificate has expired
+                                if (timediff < 0)
+                                {
+                                    printf("%s", COL_RED);
+                                }
+                                else
+                                {
+                                    printf("%s", COL_GREEN);
+                                }
+                                ASN1_TIME_print(stdoutBIO, X509_get0_notAfter(x509Cert));
+                                printf("%s", RESET);
                             }
-                            else
-                            {
-                                printf("%s", COL_GREEN);
-                            }
-                            ASN1_TIME_print(stdoutBIO, X509_get0_notAfter(x509Cert));
-                            printf("%s", RESET);
                             if (options->xmlOutput) {
                                 printf_xml("   <not-valid-after>");
                                 ASN1_TIME_print(fileBIO, X509_get0_notAfter(x509Cert));
@@ -2347,6 +2614,112 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                                 else
                                 {
                                     printf_xml("   <expired>false</expired>\n");
+                                }
+                            }
+
+                            /* Filtered expiry findings (--cert-expired/--cert-expiring). */
+                            if (options->onlyCertExpired && X509_cmp_time(X509_get0_notAfter(x509Cert), NULL) < 0)
+                            {
+                                char expiry[16];
+                                if (!options->oneline)
+                                {
+                                    if (format_asn1_date(X509_get0_notAfter(x509Cert), expiry, sizeof(expiry)))
+                                    {
+                                        printf("Certificate:  %sEXPIRED (%s)%s\n", COL_RED, expiry, RESET);
+                                    }
+                                    else
+                                    {
+                                        printf("Certificate:  %sEXPIRED%s\n", COL_RED, RESET);
+                                    }
+                                }
+                                else
+                                {
+                                    char item[64];
+                                    if (format_asn1_date(X509_get0_notAfter(x509Cert), expiry, sizeof(expiry)))
+                                        snprintf(item, sizeof(item), "expired: %s", expiry);
+                                    else
+                                        snprintf(item, sizeof(item), "expired");
+                                    append_unique_item(options->oneline_cert, sizeof(options->oneline_cert), ", ", item);
+                                }
+                            }
+                            if (options->onlyCertExpired && X509_cmp_time(X509_get0_notBefore(x509Cert), NULL) > 0)
+                            {
+                                char validfrom[16];
+                                if (!options->oneline)
+                                {
+                                    if (format_asn1_date(X509_get0_notBefore(x509Cert), validfrom, sizeof(validfrom)))
+                                    {
+                                        printf("Certificate:  %snot yet valid (valid from %s)%s\n", COL_RED, validfrom, RESET);
+                                    }
+                                    else
+                                    {
+                                        printf("Certificate:  %snot yet valid%s\n", COL_RED, RESET);
+                                    }
+                                }
+                                else
+                                {
+                                    char item[64];
+                                    if (format_asn1_date(X509_get0_notBefore(x509Cert), validfrom, sizeof(validfrom)))
+                                        snprintf(item, sizeof(item), "not-yet-valid: %s", validfrom);
+                                    else
+                                        snprintf(item, sizeof(item), "not-yet-valid");
+                                    append_unique_item(options->oneline_cert, sizeof(options->oneline_cert), ", ", item);
+                                }
+                            }
+                            if (options->onlyCertExpiring && X509_cmp_time(X509_get0_notAfter(x509Cert), NULL) >= 0
+                                && X509_cmp_time(X509_get0_notBefore(x509Cert), NULL) <= 0)
+                            {
+                                ASN1_TIME *now = ASN1_TIME_set(NULL, time(NULL));
+                                int days = 0, secs = 0;
+                                if (now != NULL && ASN1_TIME_diff(&days, &secs, now, X509_get0_notAfter(x509Cert))
+                                    && days <= options->certExpiringDays)
+                                {
+                                    char expiry[16];
+                                    if (!options->oneline)
+                                    {
+                                        if (format_asn1_date(X509_get0_notAfter(x509Cert), expiry, sizeof(expiry)))
+                                        {
+                                            printf("Certificate expires in:  %s%d days (%s)%s\n", COL_YELLOW, days, expiry, RESET);
+                                        }
+                                        else
+                                        {
+                                            printf("Certificate expires in:  %s%d days%s\n", COL_YELLOW, days, RESET);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        char item[48];
+                                        if (format_asn1_date(X509_get0_notAfter(x509Cert), expiry, sizeof(expiry)))
+                                            snprintf(item, sizeof(item), "expiring: %dd (%s)", days, expiry);
+                                        else
+                                            snprintf(item, sizeof(item), "expiring: %dd", days);
+                                        append_unique_item(options->oneline_cert, sizeof(options->oneline_cert), ", ", item);
+                                    }
+                                }
+                                ASN1_TIME_free(now);
+                            }
+
+                            /* Chain validation finding (--cert-untrusted). Only
+                             * evaluated when a CA store could be loaded. */
+                            if (options->onlyCertUntrusted && options->trustStoreState == 1 && x509Cert != NULL)
+                            {
+                                int verifyError = SSL_get_verify_result(ssl);
+                                if (verifyError != X509_V_OK)
+                                {
+                                    const char *verifyString = X509_verify_cert_error_string(verifyError);
+                                    if (!options->oneline)
+                                    {
+                                        printf("Certificate:  %suntrusted (%s)%s\n", COL_RED, verifyString, RESET);
+                                    }
+                                    else
+                                    {
+                                        char item[512];
+                                        if (certSubject != NULL)
+                                            snprintf(item, sizeof(item), "untrusted: %.100s, subject: %.200s", verifyString, certSubject);
+                                        else
+                                            snprintf(item, sizeof(item), "untrusted: %.100s", verifyString);
+                                        append_unique_item(options->oneline_cert, sizeof(options->oneline_cert), ", ", item);
+                                    }
                                 }
                             }
                             printf("\n");
@@ -3409,10 +3782,17 @@ int testProtocolCiphers(struct sslCheckOptions *options, const SSL_METHOD *sslMe
     int status;
     status = true;
 
-    /* TLSv1.3 has no RC4, 3DES or single-DES ciphersuites, so there is nothing to test here. */
-    if (sslMethod == TLSv1_3_client_method() && (options->onlyRC4 || options->only3DES || options->onlyDES))
+    /* TLSv1.3 has no RC4, 3DES, single-DES, anonymous or DHE ciphersuites, so there is nothing to test here. */
+    if (sslMethod == TLSv1_3_client_method() && (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024))
     {
-        printf("  Skipping TLSv1.3 (no RC4, 3DES or DES ciphersuites exist in TLSv1.3).\n");
+        if (options->onlyDH1024 && !(options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon))
+        {
+            printf("  Skipping TLSv1.3 (no DHE ciphersuites exist in TLSv1.3).\n");
+        }
+        else
+        {
+            printf("  Skipping TLSv1.3 (no RC4, 3DES, DES or anonymous ciphersuites exist in TLSv1.3).\n");
+        }
         return true;
     }
 
@@ -3471,13 +3851,6 @@ int testProtocolCiphers(struct sslCheckOptions *options, const SSL_METHOD *sslMe
     return true;
 }
 
-/* Appends an item to a separator-joined list buffer. */
-static void append_list_item(char *buf, size_t buflen, const char *sep, const char *item) {
-    if (buf[0] != '\0')
-        strncat(buf, sep, buflen - strlen(buf) - 1);
-    strncat(buf, item, buflen - strlen(buf) - 1);
-}
-
 /* Prints "host:port, " (bracketing IPv6 hosts) using fprintf so that it is
  * not suppressed in --oneline mode. */
 static void print_host_port(struct sslCheckOptions *options) {
@@ -3487,24 +3860,37 @@ static void print_host_port(struct sslCheckOptions *options) {
         fprintf(stdout, "%s:%d, ", options->host, options->port);
 }
 
-/* Prints the one-line per-host summary for --oneline mode.  With cipher
- * filters (--rc4/--3des/--des) the line lists the accepted ciphers;
- * otherwise it lists the supported protocols.  Hosts with no findings
- * produce no output. */
+/* Prints the one-line per-host summary for --oneline mode.  The line is
+ * composed of the non-empty dimensions below (cipher findings or protocols,
+ * plus cert findings), joined with "; ".  Hosts with no findings produce
+ * no output. */
 void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, int ssl3_supported) {
-    if (options->onlyRC4 || options->only3DES || options->onlyDES) {
-        char filters[32] = "";
-        if (options->oneline_ciphers[0] == '\0')
-            return;
-        if (options->onlyRC4)
-            append_list_item(filters, sizeof(filters), "+", "rc4");
-        if (options->only3DES)
-            append_list_item(filters, sizeof(filters), "+", "3des");
-        if (options->onlyDES)
-            append_list_item(filters, sizeof(filters), "+", "des");
-        print_host_port(options);
-        fprintf(stdout, "%s: %s\n", filters, options->oneline_ciphers);
-    } else {
+    char dim1[66000] = "";
+    char dim2[2048] = "";
+    int have1 = false;
+    int have2 = false;
+    int wantCiphers = (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024);
+    int wantCert = (options->onlyCertMD5 || options->onlyCertSHA1 || options->onlyCertShortRSA || options->onlyCertExpired || options->onlyCertExpiring || options->onlyCertSelfSigned || options->onlyCertUntrusted);
+
+    if (wantCiphers) {
+        if (options->oneline_ciphers[0] != '\0') {
+            char filters[32] = "";
+            if (options->onlyRC4)
+                append_list_item(filters, sizeof(filters), "+", "rc4");
+            if (options->only3DES)
+                append_list_item(filters, sizeof(filters), "+", "3des");
+            if (options->onlyDES)
+                append_list_item(filters, sizeof(filters), "+", "des");
+            if (options->onlyAnon)
+                append_list_item(filters, sizeof(filters), "+", "anon");
+            if (options->onlyDH1024)
+                append_list_item(filters, sizeof(filters), "+", "dh1024");
+            strncpy(dim1, filters, sizeof(dim1));
+            strncat(dim1, ": ", sizeof(dim1) - strlen(dim1) - 1);
+            strncat(dim1, options->oneline_ciphers, sizeof(dim1) - strlen(dim1) - 1);
+            have1 = true;
+        }
+    } else if (!wantCert) {
         char protocols[128] = "";
         if (ssl2_supported)
             append_list_item(protocols, sizeof(protocols), ",", "SSLv2");
@@ -3518,11 +3904,23 @@ void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, in
             append_list_item(protocols, sizeof(protocols), ",", "TLSv1.2");
         if (options->tls13_supported)
             append_list_item(protocols, sizeof(protocols), ",", "TLSv1.3");
-        if (protocols[0] == '\0')
-            return;
-        print_host_port(options);
-        fprintf(stdout, "%s\n", protocols);
+        if (protocols[0] != '\0') {
+            strncpy(dim1, protocols, sizeof(dim1));
+            have1 = true;
+        }
     }
+    if (wantCert && options->oneline_cert[0] != '\0') {
+        strncpy(dim2, options->oneline_cert, sizeof(dim2));
+        have2 = true;
+    }
+
+    if (!have1 && !have2)
+        return;
+    print_host_port(options);
+    if (have1 && have2)
+        fprintf(stdout, "%s; %s\n", dim1, dim2);
+    else
+        fprintf(stdout, "%s\n", have1 ? dim1 : dim2);
 }
 
 // Test a single host and port for ciphers...
@@ -3534,10 +3932,12 @@ int testHost(struct sslCheckOptions *options)
     int ssl2_supported = false;
     int ssl3_supported = false;
 
-    // Reset the one-line cipher collection (the options struct is reused
+    // Reset the one-line collections (the options struct is reused
     // across hosts in multi-target mode).
-    if (options->oneline)
+    if (options->oneline) {
         options->oneline_ciphers[0] = '\0';
+        options->oneline_cert[0] = '\0';
+    }
     
     // XML Output...
     printf_xml(" <ssltest host=\"%s\" sniname=\"%s\" port=\"%d\">\n", options->host, options->sniname, options->port);
@@ -3758,19 +4158,21 @@ int testHost(struct sslCheckOptions *options)
     if (options->signature_algorithms && !options->oneline)
         testSignatureAlgorithms(options);
 
-    // Certificate checks
-    if (status == true && (options->showCertificate == true || options->checkCertificate == true) && !options->oneline)
+    // Certificate checks. In one-line mode they only run when specific
+    // cert checks were requested (--cert-md5/--cert-sha1/--cert-short-rsa/--cert-expired/--cert-expiring).
+    int wantCertChecks = (options->onlyCertMD5 || options->onlyCertSHA1 || options->onlyCertShortRSA || options->onlyCertExpired || options->onlyCertExpiring || options->onlyCertSelfSigned || options->onlyCertUntrusted);
+    if (status == true && (options->showCertificate == true || options->checkCertificate == true) && (!options->oneline || wantCertChecks))
     {
         printf_xml(" <certificates>\n");
 
         // Full certificate details
-        if (status == true && (options->showCertificate == true || options->showCertificates == true))
+        if (status == true && (options->showCertificate == true || options->showCertificates == true) && !options->oneline)
         {
             status = showCertificate(options);
         }
 
         // Default certificate details
-        if (status == true && options->checkCertificate == true)
+        if (status == true && options->checkCertificate == true && (!options->oneline || wantCertChecks))
         {
             if (status != false)
                 status = checkCertificateProtocol(options, TLSv1_3_client_method());
@@ -4112,6 +4514,58 @@ int main(int argc, char *argv[])
         else if (strcmp("--des", argv[argLoop]) == 0)
             options->onlyDES = true;
 
+        // Anonymous (no authentication) ciphers only...
+        else if (strcmp("--anon", argv[argLoop]) == 0)
+            options->onlyAnon = true;
+
+        // DHE ciphers with weak (<= 1024 bit) DH params (Logjam) only...
+        else if (strcmp("--dh1024", argv[argLoop]) == 0)
+            options->onlyDH1024 = true;
+
+        // Expired (or not yet valid) certificates only...
+        else if (strcmp("--cert-expired", argv[argLoop]) == 0)
+            options->onlyCertExpired = true;
+
+        // Certificates expiring within 30 days...
+        else if (strcmp("--cert-expiring", argv[argLoop]) == 0)
+        {
+            options->onlyCertExpiring = true;
+            if (options->certExpiringDays == 0)
+                options->certExpiringDays = CERT_EXPIRING_DAYS_DEFAULT;
+        }
+
+        // Certificates expiring within N days...
+        else if (strncmp("--cert-expiring-days=", argv[argLoop], 21) == 0)
+        {
+            options->certExpiringDays = atoi(argv[argLoop] + 21);
+            if (options->certExpiringDays < 1)
+            {
+                printf_error("Invalid --cert-expiring-days value (must be a positive number of days).");
+                exit(1);
+            }
+            options->onlyCertExpiring = true;
+        }
+
+        // MD5-signed certificates only...
+        else if (strcmp("--cert-md5", argv[argLoop]) == 0)
+            options->onlyCertMD5 = true;
+
+        // SHA-1-signed certificates only...
+        else if (strcmp("--cert-sha1", argv[argLoop]) == 0)
+            options->onlyCertSHA1 = true;
+
+        // Short (<2048 bit) RSA keys only...
+        else if (strcmp("--cert-short-rsa", argv[argLoop]) == 0)
+            options->onlyCertShortRSA = true;
+
+        // Self-signed certificates only...
+        else if (strcmp("--cert-self-signed", argv[argLoop]) == 0)
+            options->onlyCertSelfSigned = true;
+
+        // Certificates untrusted by the system CA store only...
+        else if (strcmp("--cert-untrusted", argv[argLoop]) == 0)
+            options->onlyCertUntrusted = true;
+
         // One-line output (one "host:port, result" line per host, skipping
         // the renegotiation/compression/heartbleed/groups/certificate checks)...
         else if (strcmp("--oneline", argv[argLoop]) == 0)
@@ -4342,6 +4796,16 @@ int main(int argc, char *argv[])
             printf("  %s--rc4%s                Only check RC4 ciphers\n", COL_GREEN, RESET);
             printf("  %s--3des%s               Only check triple-DES (3DES) ciphers\n", COL_GREEN, RESET);
             printf("  %s--des%s                Only check single-DES (DES) ciphers\n", COL_GREEN, RESET);
+            printf("  %s--anon%s               Only check anonymous (no authentication) ciphers\n", COL_GREEN, RESET);
+            printf("  %s--dh1024%s             Only check DHE ciphers with weak (<= 1024 bit) DH params\n", COL_GREEN, RESET);
+            printf("  %s--cert-md5%s           Only check for MD5-signed certificates\n", COL_GREEN, RESET);
+            printf("  %s--cert-sha1%s          Only check for SHA-1-signed certificates\n", COL_GREEN, RESET);
+            printf("  %s--cert-short-rsa%s     Only check for short (<2048 bit) RSA keys\n", COL_GREEN, RESET);
+            printf("  %s--cert-self-signed%s   Only check for self-signed certificates\n", COL_GREEN, RESET);
+            printf("  %s--cert-untrusted%s     Only check for certificates untrusted by the system CA store\n", COL_GREEN, RESET);
+            printf("  %s--cert-expired%s       Only check for expired (or not yet valid) certificates\n", COL_GREEN, RESET);
+            printf("  %s--cert-expiring%s      Only check for certificates expiring within 30 days\n", COL_GREEN, RESET);
+            printf("  %s--cert-expiring-days=N%s  Only check for certificates expiring within N days\n", COL_GREEN, RESET);
             printf("  %s--oneline%s            Print one line per host with findings (host:port, result);\n", COL_GREEN, RESET);
             printf("                       hosts with no findings are silent; skips renegotiation,\n");
             printf("                       compression, heartbleed, groups and certificate checks\n");
@@ -5325,7 +5789,7 @@ bs *makeCiphersuiteListAll(unsigned int tls_version) {
 
 
 /* Returns a byte string with a list of all missing ciphersuites for a given TLS version (TLSv1_? constant).
- * When --rc4, --3des and/or --des is used, only ciphersuites matching the requested bulk cipher(s) are included. */
+ * When --rc4, --3des, --des and/or --anon is used, only ciphersuites matching the requested bulk cipher(s) are included. */
 bs *makeCiphersuiteListMissing(struct sslCheckOptions *options, unsigned int tls_version) {
   bs *ciphersuite_list = NULL;
 
@@ -5341,11 +5805,12 @@ bs *makeCiphersuiteListMissing(struct sslCheckOptions *options, unsigned int tls
   for (int i = 0; i < (sizeof(missing_ciphersuites) / sizeof(struct missing_ciphersuite)); i++) {
     /* Append only those that OpenSSL does not cover, and those that were not already accepted through a previous run. */
     if ((missing_ciphersuites[i].check_tls_versions & tls_version) && ((missing_ciphersuites[i].accepted_tls_versions & tls_version) == 0)) {
-      if (options->onlyRC4 || options->only3DES || options->onlyDES) {
+      if (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon) {
         int isRC4 = (strstr(missing_ciphersuites[i].protocol_name, "RC4") != NULL);
         int is3DES = (strstr(missing_ciphersuites[i].protocol_name, "3DES") != NULL);
         int isDES = (!is3DES && (strstr(missing_ciphersuites[i].protocol_name, "DES") != NULL));
-        if ((options->onlyRC4 && isRC4) || (options->only3DES && is3DES) || (options->onlyDES && isDES))
+        int isAnon = (strstr(missing_ciphersuites[i].protocol_name, "anon") != NULL);
+        if ((options->onlyRC4 && isRC4) || (options->only3DES && is3DES) || (options->onlyDES && isDES) || (options->onlyAnon && isAnon))
           bs_append_ushort(ciphersuite_list, missing_ciphersuites[i].id);
       } else {
         bs_append_ushort(ciphersuite_list, missing_ciphersuites[i].id);
@@ -5794,8 +6259,10 @@ int testMissingCiphers(struct sslCheckOptions *options, unsigned int tls_version
     timersub(&tval_end, &tval_start, &tval_elapsed);
     unsigned int milliseconds_elapsed = tval_elapsed.tv_sec * 1000 + (int)tval_elapsed.tv_usec / 1000;
 
-    /* Output the cipher information. */
-    outputCipher(options, NULL, tls_printable_name, cipher_id, cipher_name, cipher_bits, 1, milliseconds_elapsed);
+    /* Output the cipher information. In --dh1024 mode only DHE-spectrum
+     * suites are reported (DH size cannot be measured over raw sockets). */
+    if (!options->onlyDH1024 || isDHECiphersuiteName(cipher_name))
+        outputCipher(options, NULL, tls_printable_name, cipher_id, cipher_name, cipher_bits, 1, milliseconds_elapsed);
   }
 
  done:

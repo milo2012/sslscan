@@ -113,7 +113,47 @@ Only check triple-DES (3DES) ciphers. Can be combined with the protocol options 
 .TP
 .B \-\-des
 .br
-Only check single-DES (DES) ciphers. Can be combined with the protocol options (e.g. \-\-tls12) and with \-\-rc4 and \-\-3des
+Only check single-DES (DES) ciphers. Can be combined with the protocol options (e.g. \-\-tls12) and with \-\-rc4, \-\-3des and \-\-anon
+.TP
+.B \-\-anon
+.br
+Only check anonymous ciphers (no authentication, e.g. ADH/AECDH suites). Can be combined with the protocol options (e.g. \-\-tls12) and with \-\-rc4, \-\-3des and \-\-des
+.TP
+.B \-\-dh1024
+.br
+Only check DHE ciphers with weak (1024 bit or smaller) Diffie-Hellman parameters (Logjam). ECDHE and TLS 1.3 are not affected and never match. Ciphersuites OpenSSL cannot negotiate itself are reported without a measured size. Can be combined with the other cipher options (e.g. \-\-3des) and with \-\-oneline
+.TP
+.B \-\-cert\-md5
+.br
+Only check for MD5-signed certificates. Can be combined with the other \-\-cert\-* options
+.TP
+.B \-\-cert\-sha1
+.br
+Only check for SHA-1-signed certificates. Can be combined with the other \-\-cert\-* options
+.TP
+.B \-\-cert\-short\-rsa
+.br
+Only check for short (<2048 bit) RSA keys. Can be combined with the other \-\-cert\-* options
+.TP
+.B \-\-cert\-self\-signed
+.br
+Only check for self-signed certificates (issuer matches subject, scanned hostname, or *). Can be combined with the other \-\-cert\-* options
+.TP
+.B \-\-cert\-untrusted
+.br
+Only check for certificates whose chain fails validation against the system CA bundle (/etc/ssl/certs, /etc/pki, /etc/ssl/cert.pem). Self-signed certificates are included with their specific reason. If no CA bundle can be loaded, an error is reported and no findings are produced. Can be combined with the other \-\-cert\-* options
+.TP
+.B \-\-cert\-expired
+.br
+Only check for expired (or not yet valid) certificates. Can be combined with the other \-\-cert\-* options
+.TP
+.B \-\-cert\-expiring
+.br
+Only check for certificates expiring within 30 days. Certificates that already expired are only reported with \-\-cert\-expired. Can be combined with the other \-\-cert\-* options
+.TP
+.B \-\-cert\-expiring\-days=N
+.br
+Only check for certificates expiring within N days. Must be a positive number. Can be combined with the other \-\-cert\-* options
 .TP
 .B \-\-oneline
 .br

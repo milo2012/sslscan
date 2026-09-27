@@ -19,8 +19,10 @@
 #
 # macOS troubleshooting: if the final link fails with "tapi error: malformed
 # file" / "unknown architecture" in an SDK .tbd file, your Xcode linker is
-# older than the installed CommandLineTools SDK (mixed toolchain). Fix with
-# either:
+# older than the installed CommandLineTools SDK (mixed toolchain). build.sh
+# now handles the common case automatically (pins SDKROOT to the SDK shipped
+# with the active toolchain and aborts early with instructions if the
+# toolchain cannot link). If it still fails, fix the toolchain with either:
 #   sudo xcode-select --switch /Library/Developer/CommandLineTools
 # or update Xcode to the latest release and:
 #   sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
@@ -143,6 +145,67 @@ git_version() {
     echo "${ver}-static"
 }
 
+# On macOS, a linker older than the macOS SDK fails with "tapi error:
+# malformed file ... unknown architecture" in SDK .tbd files. Pin SDKROOT to
+# the SDK shipped with the active toolchain (always parseable by it), unless
+# the user already set SDKROOT. No-op on other platforms.
+pin_macos_sdkroot() {
+    [ "$(host_os)" = "mac" ] || return 0
+    if [ -n "${SDKROOT:-}" ]; then
+        info "macOS SDK (from environment): $SDKROOT"
+        return 0
+    fi
+    devdir="${DEVELOPER_DIR:-}"
+    if [ -z "$devdir" ] && command -v xcode-select >/dev/null 2>&1; then
+        devdir="$(xcode-select -p 2>/dev/null || true)"
+    fi
+    if [ -n "$devdir" ]; then
+        if [ -d "$devdir/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk" ]; then
+            SDKROOT="$devdir/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+            export SDKROOT
+        elif [ -d "$devdir/SDKs/MacOSX.sdk" ]; then
+            SDKROOT="$devdir/SDKs/MacOSX.sdk"
+            export SDKROOT
+        fi
+    fi
+    if [ -n "${SDKROOT:-}" ]; then
+        info "macOS SDK: $SDKROOT"
+    fi
+}
+
+# Compile and link a trivial program to prove the active toolchain can link
+# before spending minutes building OpenSSL. Returns non-zero on failure.
+mac_link_smoke_test() {
+    tmpd=""
+    tmpd="$(mktemp -d 2>/dev/null || mktemp -d -t sslscanbuild)" || return 1
+    cat > "$tmpd/t.c" <<'EOF'
+#include <zlib.h>
+int main(void) { return zlibVersion() == 0; }
+EOF
+    if cc -o "$tmpd/t" "$tmpd/t.c" -lz >/dev/null 2>&1; then
+        rm -rf "$tmpd"
+        return 0
+    fi
+    rm -rf "$tmpd"
+    return 1
+}
+
+mac_toolchain_error() {
+    {
+        echo "build.sh: ERROR: C toolchain cannot link even a trivial program."
+        echo "Active developer dir: $(xcode-select -p 2>/dev/null || echo unknown)"
+        echo "cc: $(cc --version 2>/dev/null | head -n 1)"
+        echo "SDKROOT: ${SDKROOT:-<unset>}"
+        echo ""
+        echo "This usually means the linker predates the macOS SDK (tapi errors about"
+        echo "unknown architectures in .tbd files). Fix with one of:"
+        echo "  sudo xcode-select --switch /Library/Developer/CommandLineTools"
+        echo "  sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer  (Xcode 26+)"
+        echo "then: ./build.sh --distclean && ./build.sh"
+    } >&2
+    exit 1
+}
+
 # --------------------------------------------------------------------------
 # Argument parsing
 # --------------------------------------------------------------------------
@@ -232,6 +295,13 @@ if [ "$NATIVE" = "yes" ] && [ "$LINK_MODE" != "fully-static" ]; then
     for tool in cc make git perl; do
         command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
     done
+    if [ "$HOST_OS" = "mac" ]; then
+        # Use the SDK shipped with the active toolchain (old linkers choke on
+        # newer SDK .tbd files), then prove the toolchain can link before
+        # spending minutes building OpenSSL.
+        pin_macos_sdkroot
+        mac_link_smoke_test || mac_toolchain_error
+    fi
     if [ "$LINK_MODE" = "dynamic" ]; then
         if ! echo '#include <openssl/ssl.h>' | cc -E - >/dev/null 2>&1; then
             if [ "$HOST_OS" = "mac" ]; then

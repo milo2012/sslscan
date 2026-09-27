@@ -35,6 +35,7 @@ This is a fork of ioerror's version of sslscan (the original readme of which is 
 
 Key changes are as follows:
 
+* Added `--oneline` mode, which prints a single summary line per host, and a `--targets` option to scan a list of hosts from a file (see [New in this fork](#new-in-this-fork) below).
 * Highlight SSLv2 and SSLv3 ciphers in output.
 * Highlight CBC ciphers on SSLv3 (POODLE).
 * Highlight 3DES and RC4 ciphers in output.
@@ -75,6 +76,59 @@ Key changes are as follows:
 * Display IANA/RFC cipher names `--iana-names`
 * Display the full certifiate chain `--show-certificates`
 * Added option to scan groups on all supported protocols `--all-groups`.
+
+## New in this fork
+
+This fork adds a `--oneline` mode for quickly checking specific protocols/ciphers against one or many hosts, and a `--targets` option for scanning a list of hosts from a file.
+
+### `--oneline`
+
+`--oneline` prints a single summary line per host instead of the full scan report. It's intended to be combined with one of the protocol or cipher filter flags below, so you can quickly test whether a specific protocol, cipher class, or certificate condition is present.
+
+```
+✗ ./sslscan-mac-arm64 --oneline --tls12 cnx-software.com:443
+cnx-software.com:443, TLSv1.2
+```
+
+Hosts with no matching findings are silent (no output), which makes `--oneline` well suited to scanning large target lists and only seeing the hosts that matter.
+
+`--oneline` also skips the renegotiation, compression, Heartbleed, group, and certificate checks, so scans complete faster.
+
+### `--targets=<file>`
+
+`--targets=<file>` allows you to scan multiple hosts from a file instead of specifying a single target on the command line. Hosts can optionally include a port (`host:port`); if no port is given, the default port is used.
+
+### Filter flags
+
+The following flags restrict `sslscan` to checking a single protocol, cipher class, or certificate condition. They can be used on their own, or combined with `--oneline` to get a compact one-line result per host:
+
+```
+  --targets=<file>     A file containing a list of hosts to check.
+                       Hosts can  be supplied  with ports (host:port)
+  --ssl2               Only check if SSLv2 is enabled
+  --ssl3               Only check if SSLv3 is enabled
+  --tls10              Only check TLSv1.0 ciphers
+  --tls11              Only check TLSv1.1 ciphers
+  --tls12              Only check TLSv1.2 ciphers
+  --tls13              Only check TLSv1.3 ciphers
+  --tlsall             Only check TLS ciphers (all versions)
+  --rc4                 Only check RC4 ciphers
+  --3des                Only check triple-DES (3DES) ciphers
+  --des                 Only check single-DES (DES) ciphers
+  --anon                Only check anonymous (no authentication) ciphers
+  --dh1024              Only check DHE ciphers with weak (<= 1024 bit) DH params
+  --cert-md5            Only check for MD5-signed certificates
+  --cert-sha1           Only check for SHA-1-signed certificates
+  --cert-short-rsa      Only check for short (<2048 bit) RSA keys
+  --cert-self-signed    Only check for self-signed certificates
+  --cert-untrusted      Only check for certificates untrusted by the system CA store
+  --cert-expired        Only check for expired (or not yet valid) certificates
+  --cert-expiring       Only check for certificates expiring within 30 days
+  --cert-expiring-days=N  Only check for certificates expiring within N days
+  --oneline             Print one line per host with findings (host:port, result);
+                        hosts with no findings are silent; skips renegotiation,
+                        compression, heartbleed, groups and certificate checks
+```
 
 ### Building on Linux
 

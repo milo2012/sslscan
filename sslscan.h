@@ -72,12 +72,15 @@
 /* Cipherlist for TLSv1.2 and below that corresponds to all available ciphersuites. */
 #define CIPHERSUITE_LIST_ALL "ALL:COMPLEMENTOFALL"
 
-/* Cipherlists used by the --rc4, --3des and --des options to test only RC4,
- * triple-DES or single-DES ciphersuites.  Combining options uses the union
- * of the selected lists (e.g. "RC4:3DES"). */
+/* Default window (days) for --cert-expiring. */
+#define CERT_EXPIRING_DAYS_DEFAULT 30
+/* Cipherlists used by the --rc4, --3des, --des and --anon options to test
+ * only RC4, triple-DES, single-DES or anonymous ciphersuites.  Combining
+ * options uses the union of the selected lists (e.g. "RC4:3DES"). */
 #define CIPHERSUITE_LIST_RC4 "RC4"
 #define CIPHERSUITE_LIST_3DES "3DES"
 #define CIPHERSUITE_LIST_DES "DES"
+#define CIPHERSUITE_LIST_ANON "aNULL"
 
 // Macros for various outputs
 /* In --oneline mode (oneline_output != 0), regular console output is
@@ -189,8 +192,20 @@ struct sslCheckOptions
     int onlyRC4;
     int only3DES;
     int onlyDES;
+    int onlyAnon;
+    int onlyDH1024;
+    int onlyCertMD5;
+    int onlyCertSHA1;
+    int onlyCertShortRSA;
+    int onlyCertExpired;
+    int onlyCertExpiring;
+    int onlyCertSelfSigned;
+    int onlyCertUntrusted;
+    int certExpiringDays;
+    int trustStoreState;
     int oneline;
     char oneline_ciphers[65536];
+    char oneline_cert[2048];
     int targets;
     int sslbugs;
     int rdp;

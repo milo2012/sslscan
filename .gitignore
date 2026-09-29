@@ -42,3 +42,4 @@ sslscan-linux-amd64-static
 sslscan-linux-arm64
 sslscan-linux-arm64-static
 sslscan-mac-arm64
+sslscan-windows-amd64.exe

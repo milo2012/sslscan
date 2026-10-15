@@ -11,7 +11,7 @@ Upstream `sslscan` is great for a deep look at one server. `sslscan2` keeps all 
 | | Upstream sslscan | sslscan2 |
 |---|---|---|
 | Output | Full multi-section report per host | Optional `--oneline`: one line per host, **only hosts with findings** |
-| Scope | Runs every check | Run **only** the checks you ask for (protocol, cipher, or certificate filters) |
+| Scope | Runs every check | `--oneline` alone runs the protocol, weak cipher and certificate checks; add filters to narrow it |
 | Multi-host | Supported via `--targets` | Same, but paired with silent-when-clean output for large sweeps |
 | Build | Makefile | Makefile **plus** `build.sh` with cross-compilation (Linux amd64/arm64, Windows x86-64) |
 | OpenSSL | System or static | Static build recommended; **OpenSSL 3.5.0 (LTS) minimum** |
@@ -23,6 +23,9 @@ Everything else from upstream still works as normal.
 ## Quick start
 
 ```bash
+# Every check in one pass: protocols, weak ciphers and certificates
+./sslscan --oneline --targets=ssl.hosts
+
 # Which hosts still speak TLS 1.0?
 ./sslscan --tls10 --oneline --targets=ssl.hosts
 
@@ -39,7 +42,7 @@ Targets can be `host` or `host:port`, one per line in the file.
 
 ## New options
 
-Filter flags restrict the scan to just that check. **They can be combined**, and each one you add widens the set of checks that run.
+Filter flags restrict the scan to just that check. **They can be combined**, and each one you add widens the set of checks that run. With `--oneline` and **no** filter flags at all, every check below runs: the supported protocols, all weak ciphers, and all certificate conditions.
 
 ### Protocol checks
 
@@ -80,13 +83,21 @@ Filter flags restrict the scan to just that check. **They can be combined**, and
 
 | Flag | Behaviour |
 |---|---|
-| `--oneline` | One line per host with findings (`host:port, result`). Hosts with no findings print nothing. Skips renegotiation, compression, Heartbleed, groups and certificate checks unless a certificate filter asks for them. |
+| `--oneline` | One line per host with findings (`host:port, result`). On its own it runs the protocol, weak cipher and certificate checks (reporting the protocols, any weak ciphers, and any certificate findings); filter flags restrict the checks that run. Hosts with no findings print nothing. Renegotiation, compression, Heartbleed and groups are always skipped. |
 
 Run `./sslscan -h` for the full option list, including the upstream options.
 
 ---
 
 ## Sample output
+
+**Everything, one line per host**
+
+```console
+$ ./sslscan-linux-amd64-static --oneline --targets=ssl.hosts
+10.17.18.131:443, TLSv1.0,TLSv1.1,TLSv1.2,TLSv1.3; 3des: ECDHE-RSA-DES-CBC3-SHA; self-signed: root, untrusted: self-signed certificate, subject: root
+10.17.18.134:443, TLSv1.2,TLSv1.3; 3des+anon: ECDHE-RSA-DES-CBC3-SHA, AECDH-DES-CBC3-SHA, DES-CBC3-SHA
+```
 
 **Weak ciphers across a target list**
 

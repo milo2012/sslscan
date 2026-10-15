@@ -1735,6 +1735,37 @@ int isDHECiphersuiteName(const char *name) {
     return (strstr(name, "DHE") != NULL || strstr(name, "_DH_") != NULL);
 }
 
+/* Bitmask of the weak-cipher checks matching a cipher.  Matches both OpenSSL
+ * and IANA/RFC cipher names so it works with --iana-names.  dhbits is the
+ * negotiated finite-field DH size (-1 when it does not use finite-field DH or
+ * is unknown). */
+#define WEAK_RC4    0x01
+#define WEAK_3DES   0x02
+#define WEAK_DES    0x04
+#define WEAK_ANON   0x08
+#define WEAK_DH1024 0x10
+
+int weakCipherReasonMask(const char *name, int dhbits) {
+    int mask = 0;
+    if (name == NULL)
+        return 0;
+    if (strstr(name, "RC4") != NULL || strstr(name, "rc4") != NULL || strstr(name, "ARCFOUR") != NULL)
+        mask |= WEAK_RC4;
+    if (strstr(name, "3DES") != NULL || strstr(name, "DES-CBC3") != NULL
+        || strstr(name, "DES_EDE") != NULL || strstr(name, "CBC3") != NULL)
+        mask |= WEAK_3DES;
+    else if (strstr(name, "DES") != NULL || strstr(name, "_DES_") != NULL)
+        mask |= WEAK_DES;
+    if (strstr(name, "ADH") != NULL || strstr(name, "AECDH") != NULL
+        || strstr(name, "anon") != NULL || strstr(name, "aNULL") != NULL)
+        mask |= WEAK_ANON;
+    /* DHE ciphers with weak (<= 1024 bit) parameters.  dhbits < 0 means the
+     * size could not be measured, in which case the suite is reported too. */
+    if (isDHECiphersuiteName(name) && dhbits <= 1024)
+        mask |= WEAK_DH1024;
+    return mask;
+}
+
 /* Outputs an accepted cipher to the console and XML file. */
 void outputCipher(struct sslCheckOptions *options, SSL *ssl, const char *cleanSslMethod, uint32_t cipherid, const char *ciphername, int cipherbits, int cipher_accepted, unsigned int milliseconds_elapsed) {
   char hexCipherId[8] = {0};
@@ -1747,7 +1778,24 @@ void outputCipher(struct sslCheckOptions *options, SSL *ssl, const char *cleanSs
     /* In one-line mode, collect the accepted cipher for the summary instead
      * of printing the full details here (console output is suppressed; the
      * XML output below stays identical to a normal run). */
-    if (options->onlyDH1024 && ssl != NULL)
+    if (options->oneline_all)
+    {
+        /* Comprehensive --oneline: collect only ciphers matching one of the
+         * weak-cipher checks, and remember which checks matched. */
+        int dhbits = (ssl != NULL) ? getFiniteFieldDHBts(ssl) : -1;
+        int mask = weakCipherReasonMask(ciphername, dhbits);
+        if (mask != 0)
+        {
+            char item[160];
+            options->oneline_weak_reasons |= mask;
+            if ((mask & WEAK_DH1024) && (dhbits > 0) && (dhbits <= 1024))
+                snprintf(item, sizeof(item), "%.100s (%d)", ciphername, dhbits);
+            else
+                snprintf(item, sizeof(item), "%.120s", ciphername);
+            append_unique_item(options->oneline_ciphers, sizeof(options->oneline_ciphers), ", ", item);
+        }
+    }
+    else if (options->onlyDH1024 && ssl != NULL)
     {
         /* In --dh1024 mode, collect the cipher with its measured DH size. */
         int dhbits = getFiniteFieldDHBts(ssl);
@@ -3860,10 +3908,40 @@ static void print_host_port(struct sslCheckOptions *options) {
         fprintf(stdout, "%s:%d, ", options->host, options->port);
 }
 
+/* Appends a non-empty section to the one-line summary, joined with "; ". */
+static void append_section(char *buf, size_t buflen, const char *section) {
+    if (section == NULL || section[0] == '\0')
+        return;
+    if (buf[0] != '\0')
+        strncat(buf, "; ", buflen - strlen(buf) - 1);
+    strncat(buf, section, buflen - strlen(buf) - 1);
+}
+
+/* Builds the list of supported protocols into buf. */
+static void build_protocol_list(struct sslCheckOptions *options, int ssl2_supported, int ssl3_supported, char *buf, size_t buflen) {
+    buf[0] = '\0';
+    if (ssl2_supported)
+        append_list_item(buf, buflen, ",", "SSLv2");
+    if (ssl3_supported)
+        append_list_item(buf, buflen, ",", "SSLv3");
+    if (options->tls10_supported)
+        append_list_item(buf, buflen, ",", "TLSv1.0");
+    if (options->tls11_supported)
+        append_list_item(buf, buflen, ",", "TLSv1.1");
+    if (options->tls12_supported)
+        append_list_item(buf, buflen, ",", "TLSv1.2");
+    if (options->tls13_supported)
+        append_list_item(buf, buflen, ",", "TLSv1.3");
+}
+
 /* Prints the one-line per-host summary for --oneline mode.  The line is
  * composed of the non-empty dimensions below (cipher findings or protocols,
  * plus cert findings), joined with "; ".  Hosts with no findings produce
- * no output. */
+ * no output.
+ *
+ * With --oneline alone (no filter flags) every check runs, so the line
+ * lists the supported protocols, any weak ciphers found, and any
+ * certificate findings. */
 void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, int ssl3_supported) {
     char dim1[66000] = "";
     char dim2[2048] = "";
@@ -3871,6 +3949,37 @@ void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, in
     int have2 = false;
     int wantCiphers = (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024);
     int wantCert = (options->onlyCertMD5 || options->onlyCertSHA1 || options->onlyCertShortRSA || options->onlyCertExpired || options->onlyCertExpiring || options->onlyCertSelfSigned || options->onlyCertUntrusted);
+
+    if (options->oneline_all) {
+        char line[70000] = "";
+        char protocols[128] = "";
+        build_protocol_list(options, ssl2_supported, ssl3_supported, protocols, sizeof(protocols));
+        append_section(line, sizeof(line), protocols);
+        if (options->oneline_ciphers[0] != '\0') {
+            char dim[66000] = "";
+            char filters[32] = "";
+            if (options->oneline_weak_reasons & WEAK_RC4)
+                append_list_item(filters, sizeof(filters), "+", "rc4");
+            if (options->oneline_weak_reasons & WEAK_3DES)
+                append_list_item(filters, sizeof(filters), "+", "3des");
+            if (options->oneline_weak_reasons & WEAK_DES)
+                append_list_item(filters, sizeof(filters), "+", "des");
+            if (options->oneline_weak_reasons & WEAK_ANON)
+                append_list_item(filters, sizeof(filters), "+", "anon");
+            if (options->oneline_weak_reasons & WEAK_DH1024)
+                append_list_item(filters, sizeof(filters), "+", "dh1024");
+            strncpy(dim, filters, sizeof(dim) - 1);
+            strncat(dim, ": ", sizeof(dim) - strlen(dim) - 1);
+            strncat(dim, options->oneline_ciphers, sizeof(dim) - strlen(dim) - 1);
+            append_section(line, sizeof(line), dim);
+        }
+        append_section(line, sizeof(line), options->oneline_cert);
+        if (line[0] == '\0')
+            return;
+        print_host_port(options);
+        fprintf(stdout, "%s\n", line);
+        return;
+    }
 
     if (wantCiphers) {
         if (options->oneline_ciphers[0] != '\0') {
@@ -3892,18 +4001,7 @@ void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, in
         }
     } else if (!wantCert) {
         char protocols[128] = "";
-        if (ssl2_supported)
-            append_list_item(protocols, sizeof(protocols), ",", "SSLv2");
-        if (ssl3_supported)
-            append_list_item(protocols, sizeof(protocols), ",", "SSLv3");
-        if (options->tls10_supported)
-            append_list_item(protocols, sizeof(protocols), ",", "TLSv1.0");
-        if (options->tls11_supported)
-            append_list_item(protocols, sizeof(protocols), ",", "TLSv1.1");
-        if (options->tls12_supported)
-            append_list_item(protocols, sizeof(protocols), ",", "TLSv1.2");
-        if (options->tls13_supported)
-            append_list_item(protocols, sizeof(protocols), ",", "TLSv1.3");
+        build_protocol_list(options, ssl2_supported, ssl3_supported, protocols, sizeof(protocols));
         if (protocols[0] != '\0') {
             strncpy(dim1, protocols, sizeof(dim1));
             have1 = true;
@@ -3937,6 +4035,7 @@ int testHost(struct sslCheckOptions *options)
     if (options->oneline) {
         options->oneline_ciphers[0] = '\0';
         options->oneline_cert[0] = '\0';
+        options->oneline_weak_reasons = 0;
     }
     
     // XML Output...
@@ -4725,6 +4824,32 @@ int main(int argc, char *argv[])
             mode = mode_help;
     }
 
+    /* --oneline with no explicit cipher or certificate filter runs every
+     * check in the "New options" set: protocols (the default), all weak
+     * cipher checks and all certificate checks.  Explicit filters still
+     * restrict the scan as before. */
+    if (options->oneline && (mode == mode_single || mode == mode_multiple))
+    {
+        int haveProtocolFilter = (options->sslVersion != ssl_all);
+        int haveCipherFilter = (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024);
+        int haveCertFilter = (options->onlyCertMD5 || options->onlyCertSHA1 || options->onlyCertShortRSA || options->onlyCertExpired || options->onlyCertExpiring || options->onlyCertSelfSigned || options->onlyCertUntrusted);
+        if (!haveProtocolFilter && !haveCipherFilter && !haveCertFilter)
+        {
+            options->oneline_all = true;
+
+            /* Enable every certificate check so the findings are collected. */
+            options->onlyCertMD5 = true;
+            options->onlyCertSHA1 = true;
+            options->onlyCertShortRSA = true;
+            options->onlyCertExpired = true;
+            options->onlyCertExpiring = true;
+            options->onlyCertSelfSigned = true;
+            options->onlyCertUntrusted = true;
+            if (options->certExpiringDays == 0)
+                options->certExpiringDays = CERT_EXPIRING_DAYS_DEFAULT;
+        }
+    }
+
     // Open XML file output...
     if ((xmlArg > 0) && (mode != mode_help))
     {
@@ -4807,8 +4932,9 @@ int main(int argc, char *argv[])
             printf("  %s--cert-expiring%s      Only check for certificates expiring within 30 days\n", COL_GREEN, RESET);
             printf("  %s--cert-expiring-days=N%s  Only check for certificates expiring within N days\n", COL_GREEN, RESET);
             printf("  %s--oneline%s            Print one line per host with findings (host:port, result);\n", COL_GREEN, RESET);
-            printf("                       hosts with no findings are silent; skips renegotiation,\n");
-            printf("                       compression, heartbleed, groups and certificate checks\n");
+            printf("                       alone it runs the protocol, weak cipher and certificate\n");
+            printf("                       checks; add filter flags to restrict it. Skips renegotiation,\n");
+            printf("                       compression, heartbleed and groups\n");
             printf("  %s--show-ciphers%s       Show supported client ciphers\n", COL_GREEN, RESET);
             printf("  %s--show-cipher-ids%s    Show cipher ids\n", COL_GREEN, RESET);
             printf("  %s--iana-names%s         Use IANA/RFC cipher names rather than OpenSSL ones\n", COL_GREEN, RESET);

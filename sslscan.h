@@ -204,6 +204,13 @@ struct sslCheckOptions
     int certExpiringDays;
     int trustStoreState;
     int oneline;
+    /* Set when --oneline is used without an explicit cipher/certificate
+     * filter: run every check (protocols, weak ciphers and certificates)
+     * and report all findings. */
+    int oneline_all;
+    /* Bitmask of weak-cipher checks that matched during a comprehensive
+     * --oneline run (see WEAK_* in sslscan.c). */
+    int oneline_weak_reasons;
     char oneline_ciphers[65536];
     char oneline_cert[2048];
     int targets;

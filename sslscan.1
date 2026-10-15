@@ -159,10 +159,14 @@ Only check for certificates expiring within N days. Must be a positive number. C
 .br
 Print one line per host with findings (host:port, result) instead of the
 full report.
-With \-\-rc4, \-\-3des or \-\-des the line lists the accepted ciphers;
-otherwise it lists the supported protocols. Hosts with no findings produce
+On its own it runs the protocol, weak cipher and certificate checks, so the
+line lists the supported protocols, any weak ciphers found (labelled with the
+matching \-\-rc4/\-\-3des/\-\-des/\-\-anon/\-\-dh1024 checks) and any
+certificate findings. Adding filter flags restricts the checks that run; with
+\-\-rc4, \-\-3des or \-\-des the line lists the accepted ciphers, otherwise it
+lists the supported protocols. Hosts with no findings produce
 no output. Renegotiation,
-compression, heartbleed, group and certificate checks are skipped.
+compression, heartbleed and group checks are skipped.
 Unreachable hosts are reported as ERROR.
 .TP
 .B \-\-ocsp

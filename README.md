@@ -34,6 +34,9 @@ Everything else from upstream still works as normal.
 
 # Self-signed or untrusted certificates, in one pass
 ./sslscan --cert-self-signed --cert-untrusted --oneline --targets=ssl.hosts
+
+# Hosts that accept insecure legacy renegotiation (CVE-2009-3555)
+./sslscan --insecure-reneg --oneline --targets=ssl.hosts
 ```
 
 Targets can be `host` or `host:port`, one per line in the file.
@@ -56,6 +59,16 @@ Filter flags restrict the scan to just that check. **They can be combined**, and
 | `--tls13` | TLSv1.3 ciphers |
 | `--tlsall` | TLS ciphers, all versions |
 
+### Renegotiation check
+
+| Flag | Checks for |
+|---|---|
+| `--insecure-reneg` | Insecure legacy renegotiation accepted (CVE-2009-3555); aliases `--insecure-renegotiation`, `--reneg` |
+
+This check is **opt-in** even with `--oneline` (unlike the other filters): because
+it needs an extra TLS 1.0 connection per host and can be slow on large target
+lists, plain `--oneline` does not run it.
+
 ### Weak cipher checks
 
 | Flag | Checks for |
@@ -65,6 +78,7 @@ Filter flags restrict the scan to just that check. **They can be combined**, and
 | `--des` | Single-DES ciphers |
 | `--anon` | Anonymous (no authentication) ciphers |
 | `--dh1024` | DHE ciphers with weak (<= 1024 bit) DH parameters |
+| `--export-ciphers` | Export-grade (40/56-bit) ciphers (FREAK/Logjam-era; alias `--export`) |
 
 ### Certificate checks
 
@@ -83,7 +97,37 @@ Filter flags restrict the scan to just that check. **They can be combined**, and
 
 | Flag | Behaviour |
 |---|---|
-| `--oneline` | One line per host with findings (`host:port, result`). On its own it runs the protocol, weak cipher and certificate checks (reporting the protocols, any weak ciphers, and any certificate findings); filter flags restrict the checks that run. Hosts with no findings print nothing. Renegotiation, compression, Heartbleed and groups are always skipped. |
+| `--oneline` | One line per host with findings (`host:port, result`). On its own it runs the protocol, weak cipher and certificate checks (reporting the protocols, any weak ciphers, and any certificate findings); filter flags restrict the checks that run. Hosts with no findings print nothing. Compression, Heartbleed and groups are always skipped; renegotiation runs only with `--insecure-reneg` (and is reported as `insecure-reneg`). |
+
+### STARTTLS
+
+For services where TLS is negotiated as part of another protocol, use the
+matching `--starttls-*` flag (the default port is set automatically):
+
+| Flag | Service | Default port |
+|---|---|---|
+| `--starttls-ftp` | FTP | 21 |
+| `--starttls-imap` | IMAP | 143 |
+| `--starttls-irc` | IRC | 6667 |
+| `--starttls-ldap` | LDAP | 389 |
+| `--starttls-pop3` | POP3 | 110 |
+| `--starttls-smtp` | SMTP | 25 |
+| `--starttls-mysql` | MySQL | 3306 |
+| `--starttls-psql` | PostgreSQL | 5432 |
+| `--starttls-mssql` | Microsoft SQL Server (TDS) | 1433 |
+| `--starttls-xmpp` | XMPP | 5222 |
+| `--rdp` | RDP | 3389 |
+
+`--starttls-mssql` performs the TDS PRELOGIN exchange with SQL Server and
+tunnels the TLS handshake inside TDS PRELOGIN (`0x12`) packets, which is what
+TDS 7.x (all current SQL Server releases) requires. Without it, pointing
+sslscan at port 1433 will not complete a handshake, because SQL Server does
+not speak plain TLS there.
+
+```console
+$ ./sslscan --starttls-mssql --oneline 10.0.0.5:1433
+10.0.0.5:1433, TLSv1.2; 3des: DES-CBC3-SHA; self-signed: sql01, ...
+```
 
 Run `./sslscan -h` for the full option list, including the upstream options.
 
@@ -107,6 +151,14 @@ $ ./sslscan-linux-amd64-static --3des --oneline --targets=ssl.hosts
 10.17.18.132:443, 3des: ECDHE-RSA-DES-CBC3-SHA
 10.17.18.134:443, 3des: ECDHE-RSA-DES-CBC3-SHA, DHE-RSA-DES-CBC3-SHA, AECDH-DES-CBC3-SHA
 10.17.18.184:5634, 3des: DES-CBC3-SHA
+```
+
+**Insecure legacy renegotiation (CVE-2009-3555)**
+
+```console
+$ ./sslscan-linux-amd64-static --insecure-reneg --oneline --targets=ssl.hosts
+10.17.18.131:443, insecure-reneg
+10.17.18.184:5634, insecure-reneg
 ```
 
 **Combined certificate checks**

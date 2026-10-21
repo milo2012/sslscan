@@ -405,6 +405,379 @@ int tcpConnectSocket(int socket, struct sslCheckOptions *options, char *error, i
     return status;
 }
 
+/* -------------------------------------------------------------------------
+ * MSSQL / TDS (Tabular Data Stream) support.
+ *
+ * Microsoft SQL Server (TDS 7.x) does not expose a plain TLS listener.  The
+ * client first sends a PRELOGIN packet; if wire encryption is negotiated, the
+ * TLS handshake records are then tunnelled inside TDS packets whose message
+ * type is PRELOGIN (0x12).  These helpers implement that framing so that the
+ * rest of the scanner can talk TLS transparently.
+ * ------------------------------------------------------------------------- */
+
+#define TDS_PRELOGIN_PACKET_TYPE 0x12
+#define TDS_MAX_DATA_LEN 4088   /* default 4096 byte packet minus 8 byte header */
+
+#define MSSQL_ENCRYPT_OFF 0x00
+#define MSSQL_ENCRYPT_ON 0x01
+#define MSSQL_ENCRYPT_NOT_SUP 0x02
+#define MSSQL_ENCRYPT_REQ 0x03
+
+/* Set once a TDS/TLS session has been negotiated for the current connection. */
+static int tds_active = 0;
+
+/* Holds TDS packet payload (which is plain TLS bytes) read from the socket but
+ * not yet consumed by the caller, so TLS records split across TDS packets are
+ * reassembled correctly. */
+static unsigned char tds_readbuf[32768];
+static size_t tds_readlen = 0;
+static size_t tds_readpos = 0;
+
+/* Writes all of buf to the socket, retrying short writes. */
+static int socketWriteAll(int s, const unsigned char *buf, size_t len)
+{
+    size_t sent = 0;
+
+    while (sent < len)
+    {
+        ssize_t n = send(s, (const char *)(buf + sent), (int)(len - sent), 0);
+        if (n <= 0)
+            return -1;
+        sent += (size_t)n;
+    }
+    return (int)len;
+}
+
+/* Reads exactly len bytes from the socket, retrying short reads. */
+static int socketReadAll(int s, unsigned char *buf, size_t len)
+{
+    size_t got = 0;
+
+    while (got < len)
+    {
+        ssize_t n = recv(s, (char *)(buf + got), (int)(len - got), 0);
+        if (n <= 0)
+            return -1;
+        got += (size_t)n;
+    }
+    return (int)len;
+}
+
+/* Frames a blob of TLS bytes as one or more TDS PRELOGIN packets and sends
+ * them.  Returns the number of bytes sent, or -1 on error. */
+static int tdsSend(int s, const unsigned char *buf, size_t len)
+{
+    size_t off = 0;
+    unsigned char pktid = 1;
+
+    if (len == 0)
+        return 0;
+
+    while (off < len)
+    {
+        size_t chunk = len - off;
+        unsigned char header[8];
+
+        if (chunk > TDS_MAX_DATA_LEN)
+            chunk = TDS_MAX_DATA_LEN;
+
+        header[0] = TDS_PRELOGIN_PACKET_TYPE;
+        header[1] = (off + chunk >= len) ? 0x01 : 0x00;  /* EOM flag */
+        header[2] = (unsigned char)((chunk + 8) >> 8);
+        header[3] = (unsigned char)((chunk + 8) & 0xff);
+        header[4] = 0x00;
+        header[5] = 0x00;
+        header[6] = pktid++;
+        header[7] = 0x00;
+
+        if (socketWriteAll(s, header, sizeof(header)) < 0)
+            return -1;
+        if (socketWriteAll(s, buf + off, chunk) < 0)
+            return -1;
+
+        off += chunk;
+    }
+
+    return (int)len;
+}
+
+/* Reads TLS bytes from the socket, stripping TDS packet headers.  Returns the
+ * number of bytes read (at least one unless len is 0), or -1 on error. */
+static int tdsRecv(int s, unsigned char *buf, size_t len)
+{
+    size_t copied = 0;
+
+    if (len == 0)
+        return 0;
+
+    while (copied < len)
+    {
+        /* Serve any buffered TLS bytes first. */
+        if (tds_readpos < tds_readlen)
+        {
+            size_t avail = tds_readlen - tds_readpos;
+            size_t take = (len - copied < avail) ? (len - copied) : avail;
+
+            memcpy(buf + copied, tds_readbuf + tds_readpos, take);
+            tds_readpos += take;
+            copied += take;
+            continue;
+        }
+
+        /* Fetch the next TDS packet. */
+        {
+            unsigned char header[8];
+            unsigned int packet_len;
+            size_t payload_len;
+
+            if (socketReadAll(s, header, sizeof(header)) < 0)
+                return (copied > 0) ? (int)copied : -1;
+
+            packet_len = ((unsigned int)header[2] << 8) | header[3];
+            if (packet_len < 8)
+                return (copied > 0) ? (int)copied : -1;
+
+            payload_len = packet_len - 8;
+            if (payload_len > sizeof(tds_readbuf))
+                return (copied > 0) ? (int)copied : -1;
+
+            if (socketReadAll(s, tds_readbuf, payload_len) < 0)
+                return (copied > 0) ? (int)copied : -1;
+
+            tds_readlen = payload_len;
+            tds_readpos = 0;
+        }
+    }
+
+    return (int)copied;
+}
+
+/* TLS send/recv helpers used by the raw (non-OpenSSL) TLS code paths. */
+static int tlsSend(int s, const void *buf, size_t len)
+{
+    if (!tds_active)
+        return send(s, (const char *)buf, (int)len, 0);
+    return tdsSend(s, (const unsigned char *)buf, len);
+}
+
+static int tlsRecv(int s, void *buf, size_t len)
+{
+    if (!tds_active)
+        return recv(s, (char *)buf, (int)len, 0);
+    return tdsRecv(s, (unsigned char *)buf, len);
+}
+
+/* Performs the MSSQL/TDS PRELOGIN exchange and, if encryption is negotiated,
+ * enables TDS framing for the connection.  Returns 1 on success, 0 on error. */
+static int mssqlStartTLS(struct sslCheckOptions *options, int s)
+{
+    /* PRELOGIN request: VERSION, ENCRYPTION (ON), INSTOPT, THREADID, MARS. */
+    static const unsigned char prelogin[] = {
+        0x12, 0x01, 0x00, 0x2f, 0x00, 0x00, 0x01, 0x00, /* TDS header */
+        0x00, 0x00, 0x1a, 0x00, 0x06,                   /* VERSION (offset 26, len 6) */
+        0x01, 0x00, 0x20, 0x00, 0x01,                   /* ENCRYPTION (offset 32, len 1) */
+        0x02, 0x00, 0x21, 0x00, 0x01,                   /* INSTOPT (offset 33, len 1) */
+        0x03, 0x00, 0x22, 0x00, 0x04,                   /* THREADID (offset 34, len 4) */
+        0x04, 0x00, 0x26, 0x00, 0x01,                   /* MARS (offset 38, len 1) */
+        0xff,                                           /* TERMINATOR */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             /* VERSION data */
+        MSSQL_ENCRYPT_ON,                               /* ENCRYPTION data */
+        0x00,                                           /* INSTOPT data */
+        0x00, 0x00, 0x00, 0x00,                         /* THREADID data */
+        0x00                                            /* MARS data */
+    };
+    unsigned char header[8];
+    unsigned char payload[4096];
+    size_t total = 0;
+    int eom = 0;
+    int encrypt = MSSQL_ENCRYPT_OFF;
+
+    if (socketWriteAll(s, prelogin, sizeof(prelogin)) < 0)
+    {
+        printf_error("Could not send MSSQL PRELOGIN packet to %s:%d.", options->host, options->port);
+        return 0;
+    }
+
+    /* Read the PRELOGIN response (potentially spanning several TDS packets). */
+    while (!eom)
+    {
+        unsigned int packet_len;
+
+        if (socketReadAll(s, header, sizeof(header)) < 0)
+        {
+            printf_error("Unexpected EOF reading MSSQL PRELOGIN response from %s:%d.", options->host, options->port);
+            return 0;
+        }
+
+        packet_len = ((unsigned int)header[2] << 8) | header[3];
+        if (packet_len < 8 || (size_t)(packet_len - 8) > sizeof(payload) - total)
+        {
+            printf_error("Invalid MSSQL PRELOGIN response from %s:%d.", options->host, options->port);
+            return 0;
+        }
+
+        if (socketReadAll(s, payload + total, packet_len - 8) < 0)
+        {
+            printf_error("Unexpected EOF reading MSSQL PRELOGIN response from %s:%d.", options->host, options->port);
+            return 0;
+        }
+
+        total += packet_len - 8;
+        eom = header[1] & 0x01;
+    }
+
+    /* Locate the server's ENCRYPTION option (token 0x01). */
+    {
+        size_t i = 0;
+
+        while (i + 5 <= total && payload[i] != 0xff)
+        {
+            unsigned char token = payload[i];
+            unsigned int opt_off = ((unsigned int)payload[i + 1] << 8) | payload[i + 2];
+            unsigned int opt_len = ((unsigned int)payload[i + 3] << 8) | payload[i + 4];
+
+            if (token == 0x01 && opt_len >= 1 && (size_t)opt_off + 1 <= total)
+            {
+                encrypt = payload[opt_off];
+                break;
+            }
+
+            i += 5;
+        }
+    }
+
+    if (encrypt == MSSQL_ENCRYPT_NOT_SUP)
+    {
+        printf_error("The MSSQL service on %s:%d does not support TLS encryption.", options->host, options->port);
+        return 0;
+    }
+
+    printf_verbose("MSSQL PRELOGIN negotiated encryption (ENCRYPT=%d); tunnelling TLS in TDS packets.\n", encrypt);
+
+    /* Discard anything buffered and enable TDS framing for this connection. */
+    tds_readlen = 0;
+    tds_readpos = 0;
+    tds_active = 1;
+    return 1;
+}
+
+/* Custom BIO that wraps TLS records in TDS PRELOGIN packets. */
+typedef struct {
+    int fd;
+} tdsBioData;
+
+static int tdsBioWrite(BIO *b, const char *data, int len)
+{
+    tdsBioData *d = (tdsBioData *)BIO_get_data(b);
+
+    if (d == NULL || len <= 0)
+        return 0;
+
+    return tdsSend(d->fd, (const unsigned char *)data, (size_t)len);
+}
+
+static int tdsBioRead(BIO *b, char *data, int len)
+{
+    tdsBioData *d = (tdsBioData *)BIO_get_data(b);
+
+    if (d == NULL || len <= 0)
+        return 0;
+
+    return tdsRecv(d->fd, (unsigned char *)data, (size_t)len);
+}
+
+static long tdsBioCtrl(BIO *b, int cmd, long num, void *ptr)
+{
+    (void)b;
+    (void)num;
+    (void)ptr;
+
+    switch (cmd)
+    {
+        case BIO_CTRL_FLUSH:
+        case BIO_CTRL_DUP:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int tdsBioCreate(BIO *b)
+{
+    BIO_set_init(b, 1);
+    BIO_set_data(b, NULL);
+    return 1;
+}
+
+static int tdsBioDestroy(BIO *b)
+{
+    tdsBioData *d;
+
+    if (b == NULL)
+        return 0;
+
+    d = (tdsBioData *)BIO_get_data(b);
+    if (d != NULL)
+        OPENSSL_free(d);
+
+    BIO_set_data(b, NULL);
+    BIO_set_init(b, 0);
+    return 1;
+}
+
+static BIO_METHOD *tdsBioMethod(void)
+{
+    static BIO_METHOD *method = NULL;
+
+    if (method == NULL)
+    {
+        method = BIO_meth_new(BIO_TYPE_SOURCE_SINK, "TDS");
+        if (method != NULL)
+        {
+            BIO_meth_set_write(method, tdsBioWrite);
+            BIO_meth_set_read(method, tdsBioRead);
+            BIO_meth_set_ctrl(method, tdsBioCtrl);
+            BIO_meth_set_create(method, tdsBioCreate);
+            BIO_meth_set_destroy(method, tdsBioDestroy);
+        }
+    }
+
+    return method;
+}
+
+/* Returns the BIO to attach to an SSL object for the given socket.  When TDS
+ * framing is active this is a custom TDS-wrapping BIO; otherwise the usual
+ * socket BIO. */
+static BIO *newConnectionBio(int fd)
+{
+    BIO_METHOD *method;
+    BIO *b;
+    tdsBioData *d;
+
+    if (!tds_active)
+        return BIO_new_socket(fd, BIO_NOCLOSE);
+
+    method = tdsBioMethod();
+    if (method == NULL)
+        return NULL;
+
+    b = BIO_new(method);
+    if (b == NULL)
+        return NULL;
+
+    d = (tdsBioData *)OPENSSL_malloc(sizeof(tdsBioData));
+    if (d == NULL)
+    {
+        BIO_free(b);
+        return NULL;
+    }
+
+    d->fd = fd;
+    BIO_set_data(b, d);
+    BIO_set_init(b, 1);
+    return b;
+}
+
 // Create a TCP socket
 int tcpConnect(struct sslCheckOptions *options)
 {
@@ -419,6 +792,11 @@ int tcpConnect(struct sslCheckOptions *options)
     int tlsStarted = 0;
     char buffer[BUFFERSIZE], errmsg[BUFFERSIZE];
     int status;
+
+    // A fresh connection is never TDS-framed until MSSQL PRELOGIN says so.
+    tds_active = 0;
+    tds_readlen = 0;
+    tds_readpos = 0;
 
     // Create Socket
     if (options->h_addrtype == AF_INET)
@@ -744,6 +1122,17 @@ int tcpConnect(struct sslCheckOptions *options)
         }
     }
 
+    // SQL Server (TDS): negotiate encryption, then tunnel TLS in TDS packets.
+    if (options->starttls_mssql == true && tlsStarted == false)
+    {
+        tlsStarted = 1;
+        if (!mssqlStartTLS(options, socketDescriptor))
+        {
+            close(socketDescriptor);
+            return 0;
+        }
+    }
+
     // Return
     return socketDescriptor;
 }
@@ -869,16 +1258,21 @@ int loadCerts(struct sslCheckOptions *options)
 int outputRenegotiation( struct sslCheckOptions *options, struct renegotiationOutput *outputData)
 {
 
-    printf_xml("  <renegotiation supported=\"%d\" secure=\"%d\" />\n",
-        outputData->supported, outputData->secure);
+    int insecure = (!outputData->secure && outputData->supported);
+
+    printf_xml("  <renegotiation supported=\"%d\" secure=\"%d\" vulnerable=\"%d\" />\n",
+        outputData->supported, outputData->secure, insecure);
+
+    if (insecure && options->oneline)
+        options->oneline_reneg = 1;
 
     if (outputData->secure)
     {
-        printf("%sSecure%s session renegotiation supported\n\n", COL_GREEN, RESET);
+        printf("%sSecure%s renegotiation (RFC 5746) supported\n\n", COL_GREEN, RESET);
     }
-    else if (outputData->supported)
+    else if (insecure)
     {
-        printf("%sInsecure%s session renegotiation supported\n\n", COL_RED, RESET);
+        printf("%sInsecure%s legacy renegotiation accepted (CVE-2009-3555)\n\n", COL_RED, RESET);
     }
     else
     {
@@ -945,7 +1339,7 @@ int testCompression(struct sslCheckOptions *options, const SSL_METHOD *sslMethod
                    if (ssl != NULL)
                     {
                         // Connect socket and BIO
-                        cipherConnectionBio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+                        cipherConnectionBio = newConnectionBio(socketDescriptor);
 
                         // Connect SSL and BIO
                         SSL_set_bio(ssl, cipherConnectionBio, cipherConnectionBio);
@@ -1078,7 +1472,7 @@ int testFallback(struct sslCheckOptions *options,  const SSL_METHOD *sslMethod)
                    if (ssl != NULL)
                     {
                         // Connect socket and BIO
-                        cipherConnectionBio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+                        cipherConnectionBio = newConnectionBio(socketDescriptor);
 
                         // Connect SSL and BIO
                         SSL_set_bio(ssl, cipherConnectionBio, cipherConnectionBio);
@@ -1233,7 +1627,7 @@ int testRenegotiation(struct sslCheckOptions *options, const SSL_METHOD *sslMeth
                    if (ssl != NULL)
                     {
                         // Connect socket and BIO
-                        cipherConnectionBio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+                        cipherConnectionBio = newConnectionBio(socketDescriptor);
 
                         // Connect SSL and BIO
                         SSL_set_bio(ssl, cipherConnectionBio, cipherConnectionBio);
@@ -1345,11 +1739,11 @@ int testRenegotiation(struct sslCheckOptions *options, const SSL_METHOD *sslMeth
     }
     else
     {
-        // Could not connect
+        // Could not connect.  Don't exit: in multi-target mode this host is
+        // just unreachable and the scan must continue with the next one.
         printf_error("Could not connect.");
+        status = false;
         renOut->supported = false;
-        freeRenegotiationOutput( renOut );
-        exit(1);
     }
     outputRenegotiation(options, renOut);
     freeRenegotiationOutput( renOut );
@@ -1404,7 +1798,7 @@ int testHeartbleed(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
         {
             hello[10] = 0x03;
         }
-        if (send(socketDescriptor, hello, sizeof(hello), 0) <= 0) {
+        if (tlsSend(socketDescriptor, hello, sizeof(hello)) <= 0) {
             printf_error("send() failed: %s", strerror(errno));
             exit(1);
         }
@@ -1427,7 +1821,7 @@ int testHeartbleed(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
         {
             hb[2] = 0x03;
         }
-        if (send(socketDescriptor, hb, sizeof(hb), 0) <= 0) {
+        if (tlsSend(socketDescriptor, hb, sizeof(hb)) <= 0) {
             printf_error("send() failed: %s", strerror(errno));
             exit(1);
         }
@@ -1439,7 +1833,7 @@ int testHeartbleed(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
             memset(hbbuf, 0, sizeof(hbbuf));
 
             // Read 5 byte header
-            int readResult = recv(socketDescriptor, hbbuf, 5, 0);
+            int readResult = tlsRecv(socketDescriptor, hbbuf, 5);
             if (readResult <= 0)
             {
                 break;
@@ -1458,7 +1852,7 @@ int testHeartbleed(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
             memset(hbbuf, 0, sizeof(hbbuf));
 
             // Read rest of record
-            readResult = recv(socketDescriptor, hbbuf, ln, 0);
+            readResult = tlsRecv(socketDescriptor, hbbuf, ln);
             if (readResult <= 0)
             {
                 break;
@@ -1615,7 +2009,9 @@ char *cipherRemove(char *str, const char *sub) {
 /* Builds the initial cipherstring for cipher enumeration into buf.  When
  * --rc4, --3des, --des and/or --anon is used, only the requested bulk
  * cipher(s) are included (combined as a union); otherwise all available
- * ciphersuites are used. */
+ * ciphersuites are used.  Export-grade suites are not implemented by modern
+ * OpenSSL, so --export contributes nothing here (and forces the list to match
+ * nothing when it is the only filter, skipping the OpenSSL enumeration). */
 void getInitialCipherList(struct sslCheckOptions *options, char *buf, size_t buflen) {
     buf[0] = '\0';
     if (options->onlyRC4)
@@ -1636,7 +2032,15 @@ void getInitialCipherList(struct sslCheckOptions *options, char *buf, size_t buf
         strncat(buf, CIPHERSUITE_LIST_ANON, buflen - strlen(buf) - 1);
     }
     if (buf[0] == '\0')
-        strncpy(buf, CIPHERSUITE_LIST_ALL, buflen);
+    {
+        /* --export on its own: no OpenSSL ciphers match, so use a string
+         * that matches nothing to skip the OpenSSL enumeration entirely.
+         * All export suites are found via the raw missing-ciphersuite path. */
+        if (options->onlyExport || (options->oneline && options->onlyReneg))
+            strncpy(buf, "EXPORT", buflen);
+        else
+            strncpy(buf, CIPHERSUITE_LIST_ALL, buflen);
+    }
 }
 
 /* Returns true if the cipherstring is still the initial (un-narrowed) list.
@@ -1735,6 +2139,15 @@ int isDHECiphersuiteName(const char *name) {
     return (strstr(name, "DHE") != NULL || strstr(name, "_DH_") != NULL);
 }
 
+/* True for export-grade ciphersuites, matching both OpenSSL (EXP-*) and
+ * IANA/RFC (TLS_*_EXPORT_*, including the EXPORT1024 56-bit suites). */
+int isExportCiphersuiteName(const char *name) {
+    if (name == NULL)
+        return false;
+    return (strstr(name, "EXPORT") != NULL || strstr(name, "EXP-") != NULL
+            || strstr(name, "EXP1024") != NULL);
+}
+
 /* Bitmask of the weak-cipher checks matching a cipher.  Matches both OpenSSL
  * and IANA/RFC cipher names so it works with --iana-names.  dhbits is the
  * negotiated finite-field DH size (-1 when it does not use finite-field DH or
@@ -1744,6 +2157,7 @@ int isDHECiphersuiteName(const char *name) {
 #define WEAK_DES    0x04
 #define WEAK_ANON   0x08
 #define WEAK_DH1024 0x10
+#define WEAK_EXPORT 0x20
 
 int weakCipherReasonMask(const char *name, int dhbits) {
     int mask = 0;
@@ -1763,6 +2177,8 @@ int weakCipherReasonMask(const char *name, int dhbits) {
      * size could not be measured, in which case the suite is reported too. */
     if (isDHECiphersuiteName(name) && dhbits <= 1024)
         mask |= WEAK_DH1024;
+    if (isExportCiphersuiteName(name))
+        mask |= WEAK_EXPORT;
     return mask;
 }
 
@@ -2009,7 +2425,7 @@ int testCipher(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
             if (ssl != NULL)
             {
                 // Connect socket and BIO
-                cipherConnectionBio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+                cipherConnectionBio = newConnectionBio(socketDescriptor);
 
                 // Connect SSL and BIO
                 SSL_set_bio(ssl, cipherConnectionBio, cipherConnectionBio);
@@ -2254,7 +2670,7 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                     if (ssl != NULL)
                     {
                         // Connect socket and BIO
-                        cipherConnectionBio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+                        cipherConnectionBio = newConnectionBio(socketDescriptor);
 
                         // Connect SSL and BIO
                         SSL_set_bio(ssl, cipherConnectionBio, cipherConnectionBio);
@@ -2882,7 +3298,7 @@ int ocspRequest(struct sslCheckOptions *options)
                     if (ssl != NULL)
                     {
                         // Connect socket and BIO
-                        cipherConnectionBio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+                        cipherConnectionBio = newConnectionBio(socketDescriptor);
 
                         // Connect SSL and BIO
                         SSL_set_bio(ssl, cipherConnectionBio, cipherConnectionBio);
@@ -3188,7 +3604,7 @@ int showCertificate(struct sslCheckOptions *options)
                     if (ssl != NULL)
                     {
                         // Connect socket and BIO
-                        cipherConnectionBio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+                        cipherConnectionBio = newConnectionBio(socketDescriptor);
 
                         // Connect SSL and BIO
                         SSL_set_bio(ssl, cipherConnectionBio, cipherConnectionBio);
@@ -3654,7 +4070,7 @@ int showTrustedCAs(struct sslCheckOptions *options)
                     if (ssl != NULL)
                     {
                         // Connect socket and BIO
-                        cipherConnectionBio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+                        cipherConnectionBio = newConnectionBio(socketDescriptor);
 
                         // Connect SSL and BIO
                         SSL_set_bio(ssl, cipherConnectionBio, cipherConnectionBio);
@@ -3830,16 +4246,22 @@ int testProtocolCiphers(struct sslCheckOptions *options, const SSL_METHOD *sslMe
     int status;
     status = true;
 
-    /* TLSv1.3 has no RC4, 3DES, single-DES, anonymous or DHE ciphersuites, so there is nothing to test here. */
-    if (sslMethod == TLSv1_3_client_method() && (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024))
+    int cipherFilter = (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024 || options->onlyExport);
+
+    /* TLSv1.3 has no RC4, 3DES, single-DES, anonymous, DHE or export ciphersuites, so there is nothing to test here.  A renegotiation-only --oneline run also has no ciphers to enumerate. */
+    if (sslMethod == TLSv1_3_client_method() && (cipherFilter || (options->oneline && options->onlyReneg)))
     {
-        if (options->onlyDH1024 && !(options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon))
+        if (options->onlyDH1024 && !(options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyExport || (options->oneline && options->onlyReneg)))
         {
             printf("  Skipping TLSv1.3 (no DHE ciphersuites exist in TLSv1.3).\n");
         }
+        else if (!cipherFilter)
+        {
+            printf("  Skipping TLSv1.3 (renegotiation check only).\n");
+        }
         else
         {
-            printf("  Skipping TLSv1.3 (no RC4, 3DES, DES or anonymous ciphersuites exist in TLSv1.3).\n");
+            printf("  Skipping TLSv1.3 (no RC4, 3DES, DES, export or anonymous ciphersuites exist in TLSv1.3).\n");
         }
         return true;
     }
@@ -3945,10 +4367,13 @@ static void build_protocol_list(struct sslCheckOptions *options, int ssl2_suppor
 void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, int ssl3_supported) {
     char dim1[66000] = "";
     char dim2[2048] = "";
+    char reneg[32] = "";
     int have1 = false;
     int have2 = false;
-    int wantCiphers = (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024);
+    int have3 = false;
+    int wantCiphers = (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024 || options->onlyExport);
     int wantCert = (options->onlyCertMD5 || options->onlyCertSHA1 || options->onlyCertShortRSA || options->onlyCertExpired || options->onlyCertExpiring || options->onlyCertSelfSigned || options->onlyCertUntrusted);
+    int wantReneg = options->onlyReneg;
 
     if (options->oneline_all) {
         char line[70000] = "";
@@ -3957,7 +4382,7 @@ void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, in
         append_section(line, sizeof(line), protocols);
         if (options->oneline_ciphers[0] != '\0') {
             char dim[66000] = "";
-            char filters[32] = "";
+            char filters[48] = "";
             if (options->oneline_weak_reasons & WEAK_RC4)
                 append_list_item(filters, sizeof(filters), "+", "rc4");
             if (options->oneline_weak_reasons & WEAK_3DES)
@@ -3968,6 +4393,8 @@ void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, in
                 append_list_item(filters, sizeof(filters), "+", "anon");
             if (options->oneline_weak_reasons & WEAK_DH1024)
                 append_list_item(filters, sizeof(filters), "+", "dh1024");
+            if (options->oneline_weak_reasons & WEAK_EXPORT)
+                append_list_item(filters, sizeof(filters), "+", "export");
             strncpy(dim, filters, sizeof(dim) - 1);
             strncat(dim, ": ", sizeof(dim) - strlen(dim) - 1);
             strncat(dim, options->oneline_ciphers, sizeof(dim) - strlen(dim) - 1);
@@ -3983,7 +4410,7 @@ void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, in
 
     if (wantCiphers) {
         if (options->oneline_ciphers[0] != '\0') {
-            char filters[32] = "";
+            char filters[48] = "";
             if (options->onlyRC4)
                 append_list_item(filters, sizeof(filters), "+", "rc4");
             if (options->only3DES)
@@ -3994,12 +4421,14 @@ void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, in
                 append_list_item(filters, sizeof(filters), "+", "anon");
             if (options->onlyDH1024)
                 append_list_item(filters, sizeof(filters), "+", "dh1024");
+            if (options->onlyExport)
+                append_list_item(filters, sizeof(filters), "+", "export");
             strncpy(dim1, filters, sizeof(dim1));
             strncat(dim1, ": ", sizeof(dim1) - strlen(dim1) - 1);
             strncat(dim1, options->oneline_ciphers, sizeof(dim1) - strlen(dim1) - 1);
             have1 = true;
         }
-    } else if (!wantCert) {
+    } else if (!wantCert && !wantReneg) {
         char protocols[128] = "";
         build_protocol_list(options, ssl2_supported, ssl3_supported, protocols, sizeof(protocols));
         if (protocols[0] != '\0') {
@@ -4011,14 +4440,30 @@ void printOneLineSummary(struct sslCheckOptions *options, int ssl2_supported, in
         strncpy(dim2, options->oneline_cert, sizeof(dim2));
         have2 = true;
     }
+    if (wantReneg && options->oneline_reneg) {
+        strncpy(reneg, "insecure-reneg", sizeof(reneg));
+        have3 = true;
+    }
 
-    if (!have1 && !have2)
+    if (!have1 && !have2 && !have3)
         return;
     print_host_port(options);
-    if (have1 && have2)
-        fprintf(stdout, "%s; %s\n", dim1, dim2);
-    else
-        fprintf(stdout, "%s\n", have1 ? dim1 : dim2);
+    {
+        int printed = false;
+        if (have1) {
+            fprintf(stdout, "%s", dim1);
+            printed = true;
+        }
+        if (have2) {
+            fprintf(stdout, "%s%s", printed ? "; " : "", dim2);
+            printed = true;
+        }
+        if (have3) {
+            fprintf(stdout, "%s%s", printed ? "; " : "", reneg);
+            printed = true;
+        }
+        fprintf(stdout, "\n");
+    }
 }
 
 // Test a single host and port for ciphers...
@@ -4036,7 +4481,12 @@ int testHost(struct sslCheckOptions *options)
         options->oneline_ciphers[0] = '\0';
         options->oneline_cert[0] = '\0';
         options->oneline_weak_reasons = 0;
+        options->oneline_reneg = 0;
     }
+
+    // Reset the missing-ciphersuite "accepted" state, which is global and
+    // would otherwise carry over from the previous host.
+    resetFoundCiphersuites();
     
     // XML Output...
     printf_xml(" <ssltest host=\"%s\" sniname=\"%s\" port=\"%d\">\n", options->host, options->sniname, options->port);
@@ -4164,7 +4614,7 @@ int testHost(struct sslCheckOptions *options)
         printf("  %sTLS Fallback SCSV:%s\n", COL_BLUE, RESET);
         testFallback(options, NULL);
     }
-    if (status == true && options->reneg && !options->oneline)
+    if (status == true && options->reneg && (!options->oneline || options->onlyReneg))
     {
         printf("  %sTLS renegotiation:%s\n", COL_BLUE, RESET);
         testRenegotiation(options, TLSv1_client_method());
@@ -4316,6 +4766,8 @@ int main(int argc, char *argv[])
     int maxSize;
     int xmlArg;
     int mode = mode_help;
+    int want_help = false;
+    int want_version = false;
     int msec;
     FILE *targetsFile;
     char line[1024];
@@ -4354,6 +4806,7 @@ int main(int argc, char *argv[])
     sslOptions.starttls_pop3 = false;
     sslOptions.starttls_smtp = false;
     sslOptions.starttls_mysql = false;
+    sslOptions.starttls_mssql = false;
     sslOptions.starttls_xmpp = false;
     sslOptions.starttls_psql = false;
     sslOptions.xmpp_server = false;
@@ -4424,7 +4877,7 @@ int main(int argc, char *argv[])
     {
         // Help
         if ((strcmp("--help", argv[argLoop]) == 0) || (strcmp("-h", argv[argLoop]) == 0))
-            mode = mode_help;
+            want_help = true;
 
         // targets
         else if ((strncmp("--targets=", argv[argLoop], 10) == 0) && (strlen(argv[argLoop]) > 10))
@@ -4467,7 +4920,7 @@ int main(int argc, char *argv[])
 
         // Version
         else if (strcmp("--version", argv[argLoop]) == 0)
-            mode = mode_version;
+            want_version = true;
 
         // XML Output
         else if (strncmp("--xml=", argv[argLoop], 6) == 0)
@@ -4569,6 +5022,10 @@ int main(int argc, char *argv[])
         else if (strcmp("--starttls-mysql", argv[argLoop]) == 0)
             options->starttls_mysql = true;
 
+        // StartTLS... Microsoft SQL Server (TDS)
+        else if (strcmp("--starttls-mssql", argv[argLoop]) == 0)
+            options->starttls_mssql = true;
+
         // StartTLS... XMPP
         else if (strcmp("--starttls-xmpp", argv[argLoop]) == 0)
             options->starttls_xmpp = true;
@@ -4620,6 +5077,16 @@ int main(int argc, char *argv[])
         // DHE ciphers with weak (<= 1024 bit) DH params (Logjam) only...
         else if (strcmp("--dh1024", argv[argLoop]) == 0)
             options->onlyDH1024 = true;
+
+        // Export-grade (40/56-bit) ciphers only (FREAK/Logjam-era)...
+        else if ((strcmp("--export-ciphers", argv[argLoop]) == 0) || (strcmp("--export", argv[argLoop]) == 0))
+            options->onlyExport = true;
+
+        // Insecure (legacy, CVE-2009-3555) renegotiation only...
+        else if ((strcmp("--insecure-reneg", argv[argLoop]) == 0)
+              || (strcmp("--insecure-renegotiation", argv[argLoop]) == 0)
+              || (strcmp("--reneg", argv[argLoop]) == 0))
+            options->onlyReneg = true;
 
         // Expired (or not yet valid) certificates only...
         else if (strcmp("--cert-expired", argv[argLoop]) == 0)
@@ -4808,6 +5275,8 @@ int main(int argc, char *argv[])
                     options->port = 25;
                 else if (options->starttls_mysql)
                     options->port = 3306;
+                else if (options->starttls_mssql)
+                    options->port = 1433;
                 else if (options->starttls_xmpp)
                     options->port = 5222;
                 else if (options->starttls_psql)
@@ -4824,6 +5293,20 @@ int main(int argc, char *argv[])
             mode = mode_help;
     }
 
+    /* -h/--help or --version anywhere on the command line win over
+     * target/scan arguments, and must still print if --oneline was also
+     * given (which otherwise suppresses console output). */
+    if (want_help)
+    {
+        mode = mode_help;
+        oneline_output = 0;
+    }
+    else if (want_version)
+    {
+        mode = mode_version;
+        oneline_output = 0;
+    }
+
     /* --oneline with no explicit cipher or certificate filter runs every
      * check in the "New options" set: protocols (the default), all weak
      * cipher checks and all certificate checks.  Explicit filters still
@@ -4831,7 +5314,7 @@ int main(int argc, char *argv[])
     if (options->oneline && (mode == mode_single || mode == mode_multiple))
     {
         int haveProtocolFilter = (options->sslVersion != ssl_all);
-        int haveCipherFilter = (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024);
+        int haveCipherFilter = (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyDH1024 || options->onlyExport || options->onlyReneg);
         int haveCertFilter = (options->onlyCertMD5 || options->onlyCertSHA1 || options->onlyCertShortRSA || options->onlyCertExpired || options->onlyCertExpiring || options->onlyCertSelfSigned || options->onlyCertUntrusted);
         if (!haveProtocolFilter && !haveCipherFilter && !haveCertFilter)
         {
@@ -4884,10 +5367,12 @@ int main(int argc, char *argv[])
     switch (mode)
     {
         case mode_version:
+            oneline_output = 0;
             printf("%s\n%s\n", VERSION, OpenSSL_version(OPENSSL_VERSION));
             break;
 
         case mode_help:
+            oneline_output = 0;
             // Program version banner...
             printf("%s%s%s\n", COL_BLUE, program_banner, RESET);
             printf("%s\t\t%s\n\t\t%s\n%s\n\n", COL_BLUE, VERSION,
@@ -4923,6 +5408,8 @@ int main(int argc, char *argv[])
             printf("  %s--des%s                Only check single-DES (DES) ciphers\n", COL_GREEN, RESET);
             printf("  %s--anon%s               Only check anonymous (no authentication) ciphers\n", COL_GREEN, RESET);
             printf("  %s--dh1024%s             Only check DHE ciphers with weak (<= 1024 bit) DH params\n", COL_GREEN, RESET);
+            printf("  %s--export-ciphers%s     Only check export-grade (40/56-bit) ciphers (FREAK/Logjam)\n", COL_GREEN, RESET);
+            printf("  %s--insecure-reneg%s     Only check for insecure legacy renegotiation (CVE-2009-3555)\n", COL_GREEN, RESET);
             printf("  %s--cert-md5%s           Only check for MD5-signed certificates\n", COL_GREEN, RESET);
             printf("  %s--cert-sha1%s          Only check for SHA-1-signed certificates\n", COL_GREEN, RESET);
             printf("  %s--cert-short-rsa%s     Only check for short (<2048 bit) RSA keys\n", COL_GREEN, RESET);
@@ -4933,8 +5420,8 @@ int main(int argc, char *argv[])
             printf("  %s--cert-expiring-days=N%s  Only check for certificates expiring within N days\n", COL_GREEN, RESET);
             printf("  %s--oneline%s            Print one line per host with findings (host:port, result);\n", COL_GREEN, RESET);
             printf("                       alone it runs the protocol, weak cipher and certificate\n");
-            printf("                       checks; add filter flags to restrict it. Skips renegotiation,\n");
-            printf("                       compression, heartbleed and groups\n");
+            printf("                       checks; add filter flags to restrict it. Skips compression,\n");
+            printf("                       heartbleed and groups (renegotiation only with --insecure-reneg)\n");
             printf("  %s--show-ciphers%s       Show supported client ciphers\n", COL_GREEN, RESET);
             printf("  %s--show-cipher-ids%s    Show cipher ids\n", COL_GREEN, RESET);
             printf("  %s--iana-names%s         Use IANA/RFC cipher names rather than OpenSSL ones\n", COL_GREEN, RESET);
@@ -4955,6 +5442,7 @@ int main(int argc, char *argv[])
             printf("  %s--starttls-irc%s       STARTTLS setup for IRC\n", COL_GREEN, RESET);
             printf("  %s--starttls-ldap%s      STARTTLS setup for LDAP\n", COL_GREEN, RESET);
             printf("  %s--starttls-mysql%s     STARTTLS setup for MYSQL\n", COL_GREEN, RESET);
+            printf("  %s--starttls-mssql%s     STARTTLS setup for Microsoft SQL Server (TDS)\n", COL_GREEN, RESET);
             printf("  %s--starttls-pop3%s      STARTTLS setup for POP3\n", COL_GREEN, RESET);
             printf("  %s--starttls-psql%s      STARTTLS setup for PostgreSQL\n", COL_GREEN, RESET);
             printf("  %s--starttls-smtp%s      STARTTLS setup for SMTP\n", COL_GREEN, RESET);
@@ -5124,13 +5612,13 @@ int runSSLv2Test(struct sslCheckOptions *options) {
     return false;
 
   /* Send the SSLv2 Client Hello packet. */
-  if (send(s, sslv2_client_hello, sizeof(sslv2_client_hello), 0) <= 0) {
+  if (tlsSend(s, sslv2_client_hello, sizeof(sslv2_client_hello)) <= 0) {
     printf_error("send() failed: %s", strerror(errno));
     exit(1);
   }
 
   /* Read a small amount of the response. */
-  if (recv(s, response, sizeof(response), 0) != sizeof(response))
+  if (tlsRecv(s, response, sizeof(response)) != sizeof(response))
     goto done; /* Returns false. */
 
   /* If the Handshake Message Type is Server Hello (0x04) and the Version is SSL 2.0
@@ -5266,30 +5754,33 @@ int runSSLv3Test(struct sslCheckOptions *options) {
   if (s == 0)
     return false;
 
-  /* Send the SSLv3 Client Hello packet. */
-  if (send(s, sslv3_client_hello_1, sizeof(sslv3_client_hello_1), 0) <= 0) {
-    printf_error("send() failed: %s", strerror(errno));
-    exit(1);
-  }
+  /* Send the SSLv3 Client Hello packet as a single TLS record.  When TDS
+   * framing is active the whole record must go out in one message. */
+  {
+    unsigned char client_hello[sizeof(sslv3_client_hello_1) + 4 + sizeof(sslv3_client_hello_2)];
+    size_t chlen = 0;
 
-  timestamp = htonl(time(NULL)); /* Current time stamp. */
-  timestamp_bytes[0] = timestamp & 0xff;
-  timestamp_bytes[1] = (timestamp >> 8) & 0xff;
-  timestamp_bytes[2] = (timestamp >> 16) & 0xff;
-  timestamp_bytes[3] = (timestamp >> 24) & 0xff;
+    timestamp = htonl(time(NULL)); /* Current time stamp. */
+    timestamp_bytes[0] = timestamp & 0xff;
+    timestamp_bytes[1] = (timestamp >> 8) & 0xff;
+    timestamp_bytes[2] = (timestamp >> 16) & 0xff;
+    timestamp_bytes[3] = (timestamp >> 24) & 0xff;
 
-  if (send(s, timestamp_bytes, sizeof(timestamp_bytes), 0) <= 0) {
-    printf_error("send() failed: %s", strerror(errno));
-    exit(1);
-  }
+    memcpy(client_hello + chlen, sslv3_client_hello_1, sizeof(sslv3_client_hello_1));
+    chlen += sizeof(sslv3_client_hello_1);
+    memcpy(client_hello + chlen, timestamp_bytes, sizeof(timestamp_bytes));
+    chlen += sizeof(timestamp_bytes);
+    memcpy(client_hello + chlen, sslv3_client_hello_2, sizeof(sslv3_client_hello_2));
+    chlen += sizeof(sslv3_client_hello_2);
 
-  if (send(s, sslv3_client_hello_2, sizeof(sslv3_client_hello_2), 0) <= 0) {
-    printf_error("send() failed: %s", strerror(errno));
-    exit(1);
+    if (tlsSend(s, client_hello, chlen) <= 0) {
+      printf_error("send() failed: %s", strerror(errno));
+      exit(1);
+    }
   }
 
   /* Read a small amount of the response. */
-  if (recv(s, response, sizeof(response), 0) != sizeof(response))
+  if (tlsRecv(s, response, sizeof(response)) != sizeof(response))
     goto done; /* Returns false. */
 
   /* Examine response. */
@@ -5522,7 +6013,7 @@ int bs_read_socket(bs *b, int s, size_t num_bytes) {
   /* Read in num_bytes from the socket and store it in the underlying buffer. */
   bytes_read = 0;
   while (bytes_read < num_bytes) {
-    n = recv(s, b->buf + b->len + bytes_read, num_bytes - bytes_read, 0);
+    n = tlsRecv(s, b->buf + b->len + bytes_read, num_bytes - bytes_read);
     if (n <= 0) {
       if ((errno != 0) && (errno != ECONNRESET))
         ret = errno;
@@ -5714,11 +6205,13 @@ unsigned int checkIfTLSVersionIsSupported(struct sslCheckOptions *options, unsig
 
   /* Now connect to the target server. */
   s = tcpConnect(options);
-  if (s == 0)
+  if (s == 0) {
+    s = -1; /* tcpConnect() uses 0 as its failure sentinel */
     goto done;
+  }
 
   /* Send the Client Hello message. */
-  if (send(s, bs_get_bytes(client_hello), bs_get_len(client_hello), 0) <= 0) {
+  if (tlsSend(s, bs_get_bytes(client_hello), bs_get_len(client_hello)) <= 0) {
     printf_error("send() failed while sending Client Hello: %d (%s)", errno, strerror(errno));
     goto done; /* Returns false. */
   }
@@ -5767,6 +6260,8 @@ unsigned int checkIfTLSVersionIsSupported_Backup(struct sslCheckOptions *options
   int ret = false;
   int version = -1;
   const SSL_METHOD *sslMethod = NULL;
+  int socketDescriptor = -1;
+  SSL *ssl = NULL;
 
   /* Determine the right client method, ciphersuite list, and TLS version we need to work with. */
   strncpy(options->cipherstring, CIPHERSUITE_LIST_ALL, sizeof(options->cipherstring) - 1);
@@ -5791,9 +6286,10 @@ unsigned int checkIfTLSVersionIsSupported_Backup(struct sslCheckOptions *options
   printf_verbose("Using fallback method for checking if %s is supported.\n", getPrintableTLSName(tls_version));
 
   /* Connect to the target host. */
-  int socketDescriptor = tcpConnect(options);
+  socketDescriptor = tcpConnect(options);
   if (socketDescriptor == 0) {
     printf_verbose("%s: failed to connect to target.\n", __func__);
+    socketDescriptor = -1; /* tcpConnect() uses 0 as its failure sentinel */
     goto done;
   }
 
@@ -5822,7 +6318,7 @@ unsigned int checkIfTLSVersionIsSupported_Backup(struct sslCheckOptions *options
   }
 
   /* Create the SSL object. */
-  SSL *ssl = new_SSL(options->ctx);
+  ssl = new_SSL(options->ctx);
   if (ssl == NULL) {
     printf_verbose("%s: failed to create SSL object.\n", __func__);
     goto done;
@@ -5835,7 +6331,7 @@ unsigned int checkIfTLSVersionIsSupported_Backup(struct sslCheckOptions *options
   }
 
   /* Wrap the raw socket with a new BIO. */
-  BIO *bio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+  BIO *bio = newConnectionBio(socketDescriptor);
   if (bio == NULL) {
     printf_verbose("%s: failed to create BIO socket.\n", __func__);
     goto done;
@@ -5915,7 +6411,7 @@ bs *makeCiphersuiteListAll(unsigned int tls_version) {
 
 
 /* Returns a byte string with a list of all missing ciphersuites for a given TLS version (TLSv1_? constant).
- * When --rc4, --3des, --des and/or --anon is used, only ciphersuites matching the requested bulk cipher(s) are included. */
+ * When --rc4, --3des, --des, --anon and/or --export is used, only ciphersuites matching the requested bulk cipher(s) are included. */
 bs *makeCiphersuiteListMissing(struct sslCheckOptions *options, unsigned int tls_version) {
   bs *ciphersuite_list = NULL;
 
@@ -5931,12 +6427,13 @@ bs *makeCiphersuiteListMissing(struct sslCheckOptions *options, unsigned int tls
   for (int i = 0; i < (sizeof(missing_ciphersuites) / sizeof(struct missing_ciphersuite)); i++) {
     /* Append only those that OpenSSL does not cover, and those that were not already accepted through a previous run. */
     if ((missing_ciphersuites[i].check_tls_versions & tls_version) && ((missing_ciphersuites[i].accepted_tls_versions & tls_version) == 0)) {
-      if (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon) {
+      if (options->onlyRC4 || options->only3DES || options->onlyDES || options->onlyAnon || options->onlyExport || (options->oneline && options->onlyReneg)) {
         int isRC4 = (strstr(missing_ciphersuites[i].protocol_name, "RC4") != NULL);
         int is3DES = (strstr(missing_ciphersuites[i].protocol_name, "3DES") != NULL);
         int isDES = (!is3DES && (strstr(missing_ciphersuites[i].protocol_name, "DES") != NULL));
         int isAnon = (strstr(missing_ciphersuites[i].protocol_name, "anon") != NULL);
-        if ((options->onlyRC4 && isRC4) || (options->only3DES && is3DES) || (options->onlyDES && isDES) || (options->onlyAnon && isAnon))
+        int isExport = isExportCiphersuiteName(missing_ciphersuites[i].protocol_name);
+        if ((options->onlyRC4 && isRC4) || (options->only3DES && is3DES) || (options->onlyDES && isDES) || (options->onlyAnon && isAnon) || (options->onlyExport && isExport))
           bs_append_ushort(ciphersuite_list, missing_ciphersuites[i].id);
       } else {
         bs_append_ushort(ciphersuite_list, missing_ciphersuites[i].id);
@@ -5945,6 +6442,14 @@ bs *makeCiphersuiteListMissing(struct sslCheckOptions *options, unsigned int tls
   }
 
   return ciphersuite_list;
+}
+
+/* Clears the per-host "accepted" state of the missing-ciphersuite list.  This
+ * state is global, so without resetting it the suites found on one host would
+ * be skipped on every host that follows. */
+void resetFoundCiphersuites(void) {
+  for (int i = 0; i < (sizeof(missing_ciphersuites) / sizeof(struct missing_ciphersuite)); i++)
+    missing_ciphersuites[i].accepted_tls_versions = 0;
 }
 
 /* Marks a ciphersuite as found so that it is not re-tested again. */
@@ -6260,7 +6765,7 @@ bs *makeClientHello(struct sslCheckOptions *options, unsigned int tls_version, b
 
 /* Checks all ciphersuites that OpenSSL does not support.  When version is 0, TLSv1.0 is tested.  When set to 1, TLSv1.1 is tested.  When set to 2, TLSv1.2 is tested. */
 int testMissingCiphers(struct sslCheckOptions *options, unsigned int tls_version) {
-  int ret = false, s = -1, valid_cipher_id = false;
+  int ret = false, s = -1, valid_cipher_id = false, printed_any = false;
   unsigned int tls_version_low_byte = 1;
   char *tls_printable_name = getPrintableTLSName(tls_version);
   bs *client_hello = NULL, *server_hello = NULL, *ciphersuite_list = NULL, *tls_extensions = NULL;
@@ -6304,6 +6809,11 @@ int testMissingCiphers(struct sslCheckOptions *options, unsigned int tls_version
     /* Construct the list of all ciphersuites not implemented by OpenSSL. */
     ciphersuite_list = makeCiphersuiteListMissing(options, tls_version);
 
+    /* Nothing to probe for this protocol version (e.g. a renegotiation-only
+     * --oneline run, or all matching suites already found). */
+    if (bs_get_len(ciphersuite_list) == 0)
+      goto done;
+
     client_hello = makeClientHello(options, tls_version, ciphersuite_list, tls_extensions);
     bs_free(&tls_extensions);
 
@@ -6313,7 +6823,7 @@ int testMissingCiphers(struct sslCheckOptions *options, unsigned int tls_version
       goto done;
 
     /* Send the Client Hello message. */
-    if (send(s, bs_get_bytes(client_hello), bs_get_len(client_hello), 0) <= 0) {
+    if (tlsSend(s, bs_get_bytes(client_hello), bs_get_len(client_hello)) <= 0) {
       printf_error("send() failed while sending Client Hello: %d (%s)", errno, strerror(errno));
       goto done; /* Returns false. */
     }
@@ -6388,7 +6898,17 @@ int testMissingCiphers(struct sslCheckOptions *options, unsigned int tls_version
     /* Output the cipher information. In --dh1024 mode only DHE-spectrum
      * suites are reported (DH size cannot be measured over raw sockets). */
     if (!options->onlyDH1024 || isDHECiphersuiteName(cipher_name))
+    {
         outputCipher(options, NULL, tls_printable_name, cipher_id, cipher_name, cipher_bits, 1, milliseconds_elapsed);
+        /* Only the first accepted suite is the server's preferred one.  The
+         * raw path never narrows the cipherstring, so mark it changed after
+         * the first hit to avoid labelling all the rest as "Preferred". */
+        if (!printed_any)
+        {
+            printed_any = true;
+            options->cipherstring[0] = '\0';
+        }
+    }
   }
 
  done:
@@ -6752,7 +7272,7 @@ int testSupportedGroups(struct sslCheckOptions *options) {
       }
 
       /* Send the Client Hello message. */
-      if (send(s, bs_get_bytes(client_hello), bs_get_len(client_hello), 0) <= 0) {
+      if (tlsSend(s, bs_get_bytes(client_hello), bs_get_len(client_hello)) <= 0) {
         printf_error("send() failed while sending Client Hello: %d (%s)", errno, strerror(errno));
         ret = false;
         goto done;
@@ -6995,7 +7515,7 @@ int testSignatureAlgorithms(struct sslCheckOptions *options) {
       }
 
       /* Send the Client Hello message. */
-      if (send(s, bs_get_bytes(client_hello), bs_get_len(client_hello), 0) <= 0) {
+      if (tlsSend(s, bs_get_bytes(client_hello), bs_get_len(client_hello)) <= 0) {
         printf_error("send() failed while sending Client Hello: %d (%s)", errno, strerror(errno));
         ret = false;
         goto done;

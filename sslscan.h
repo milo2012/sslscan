@@ -185,6 +185,7 @@ struct sslCheckOptions
     int starttls_pop3;
     int starttls_smtp;
     int starttls_mysql;
+    int starttls_mssql;
     int starttls_xmpp;
     int starttls_psql;
     int xmpp_server;
@@ -194,6 +195,8 @@ struct sslCheckOptions
     int onlyDES;
     int onlyAnon;
     int onlyDH1024;
+    int onlyExport;
+    int onlyReneg;
     int onlyCertMD5;
     int onlyCertSHA1;
     int onlyCertShortRSA;
@@ -211,6 +214,9 @@ struct sslCheckOptions
     /* Bitmask of weak-cipher checks that matched during a comprehensive
      * --oneline run (see WEAK_* in sslscan.c). */
     int oneline_weak_reasons;
+    /* Set when an insecure (legacy, CVE-2009-3555) renegotiation was
+     * accepted on this host during a filtered --oneline run. */
+    int oneline_reneg;
     char oneline_ciphers[65536];
     char oneline_cert[2048];
     int targets;
@@ -368,6 +374,7 @@ bs *makeCiphersuiteListMissing(struct sslCheckOptions *options, unsigned int tls
 bs *makeClientHello(struct sslCheckOptions *options, unsigned int version, bs *ciphersuite_list, bs *tls_extensions);
 bs *makeTLSExtensions(struct sslCheckOptions *options, unsigned int include_signature_algorithms);
 void markFoundCiphersuite(unsigned short server_cipher_id, unsigned int tls_version);
+void resetFoundCiphersuites(void);
 int ocsp_certid_print(BIO *bp, OCSP_CERTID *a, int indent);
 static int ocsp_resp_cb(SSL *s, void *arg);
 void readLine(FILE *, char *, int);

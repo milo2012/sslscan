@@ -123,6 +123,14 @@ Only check anonymous ciphers (no authentication, e.g. ADH/AECDH suites). Can be 
 .br
 Only check DHE ciphers with weak (1024 bit or smaller) Diffie-Hellman parameters (Logjam). ECDHE and TLS 1.3 are not affected and never match. Ciphersuites OpenSSL cannot negotiate itself are reported without a measured size. Can be combined with the other cipher options (e.g. \-\-3des) and with \-\-oneline
 .TP
+.B \-\-export\-ciphers
+.br
+Only check export-grade (40/56-bit) ciphersuites (FREAK/Logjam-era, e.g. EXP\-RC4\-MD5, EXP\-DES\-CBC\-SHA and the EXPORT1024 suites). These are not implemented by modern OpenSSL, so they are found via a raw ClientHello probe and reported by their IANA name. TLS 1.3 has no export ciphersuites and is skipped. Alias: \-\-export
+.TP
+.B \-\-insecure\-reneg
+.br
+Only check for insecure legacy renegotiation (CVE\-2009\-3555). Reports hosts that do not support RFC 5746 secure renegotiation but still accept a legacy renegotiation. This check is opt\-in even with \-\-oneline (it needs an extra TLS 1.0 connection per host). Aliases: \-\-insecure\-renegotiation, \-\-reneg
+.TP
 .B \-\-cert\-md5
 .br
 Only check for MD5-signed certificates. Can be combined with the other \-\-cert\-* options
@@ -161,13 +169,13 @@ Print one line per host with findings (host:port, result) instead of the
 full report.
 On its own it runs the protocol, weak cipher and certificate checks, so the
 line lists the supported protocols, any weak ciphers found (labelled with the
-matching \-\-rc4/\-\-3des/\-\-des/\-\-anon/\-\-dh1024 checks) and any
+matching \-\-rc4/\-\-3des/\-\-des/\-\-anon/\-\-dh1024/\-\-export-ciphers checks) and any
 certificate findings. Adding filter flags restricts the checks that run; with
 \-\-rc4, \-\-3des or \-\-des the line lists the accepted ciphers, otherwise it
 lists the supported protocols. Hosts with no findings produce
-no output. Renegotiation,
-compression, heartbleed and group checks are skipped.
-Unreachable hosts are reported as ERROR.
+no output. Renegotiation runs only when \-\-insecure\-reneg is given and is
+then reported as insecure\-reneg; compression, heartbleed and group checks
+are skipped. Unreachable hosts are reported as ERROR.
 .TP
 .B \-\-ocsp
 .br
@@ -231,6 +239,10 @@ STARTTLS setup for SMTP
 .TP
 .B \-\-starttls\-mysql
 STARTTLS setup for MySQL
+.TP
+.B \-\-starttls\-mssql
+STARTTLS setup for Microsoft SQL Server (TDS). Performs the TDS PRELOGIN
+handshake and tunnels TLS inside TDS packets. Defaults to port 1433.
 .TP
 .B \-\-starttls\-xmpp
 STARTTLS setup for XMPP
